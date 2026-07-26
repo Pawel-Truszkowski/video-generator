@@ -1,0 +1,97 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e0e0e0; min-height: 100vh; }
+.container { max-width: 900px; margin: 0 auto; padding: 24px; }
+h1 { font-size: 1.5rem; margin-bottom: 8px; color: #fff; }
+h2 { font-size: 1.2rem; margin: 16px 0 8px; color: #ccc; }
+.subtitle { color: #888; font-size: 0.9rem; margin-bottom: 24px; }
+
+/* Form */
+.form-group { margin-bottom: 16px; }
+label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 4px; }
+textarea, select, input[type="number"] {
+  width: 100%; padding: 10px; border: 1px solid #333; border-radius: 6px;
+  background: #1a1d27; color: #e0e0e0; font-size: 0.9rem;
+}
+input[type="range"] {
+  width: 100%; accent-color: #4f8cff; margin-top: 4px;
+}
+textarea { min-height: 80px; resize: vertical; }
+
+.dropzone {
+  border: 2px dashed #444; border-radius: 8px; padding: 32px; text-align: center;
+  cursor: pointer; transition: border-color 0.2s; color: #888;
+}
+.dropzone.dragover { border-color: #4f8cff; background: rgba(79,140,255,0.05); }
+.dropzone input { display: none; }
+.previews { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.preview-thumb {
+  width: 80px; height: 60px; object-fit: cover; border-radius: 4px; border: 1px solid #333;
+}
+.preview-item { position: relative; }
+.preview-remove {
+  position: absolute; top: -6px; right: -6px; width: 20px; height: 20px;
+  background: #e74c3c; color: #fff; border: none; border-radius: 50%;
+  font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+}
+
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+
+button {
+  padding: 10px 24px; border: none; border-radius: 6px; font-size: 0.9rem;
+  cursor: pointer; font-weight: 600; transition: opacity 0.2s;
+}
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary { background: #4f8cff; color: #fff; }
+.btn-primary:hover:not(:disabled) { background: #3a75e6; }
+.btn-success { background: #27ae60; color: #fff; }
+.btn-danger { background: #e74c3c; color: #fff; }
+
+/* Scenes */
+.scene-card {
+  background: #1a1d27; border: 1px solid #333; border-radius: 8px;
+  padding: 12px; margin-bottom: 8px; display: flex; gap: 12px; align-items: flex-start;
+}
+.scene-card img { width: 100px; height: 75px; object-fit: cover; border-radius: 4px; }
+.scene-info { flex: 1; }
+.scene-info textarea { min-height: 40px; margin-top: 4px; font-size: 0.8rem; }
+.scene-info select { margin-top: 4px; font-size: 0.8rem; width: auto; }
+.scene-idx { font-weight: 700; color: #4f8cff; font-size: 0.8rem; display: flex; justify-content: space-between; align-items: center; }
+.scene-remove {
+  background: #e74c3c; color: #fff; border: none; border-radius: 4px;
+  font-size: 0.7rem; padding: 2px 8px; cursor: pointer;
+}
+.scene-remove:hover { background: #c0392b; }
+.scene-card .scene-controls { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.scene-card .scene-controls select { width: auto; min-width: 60px; }
+.scene-card .scene-controls label { margin: 0; font-size: 0.75rem; }
+
+.cost-box {
+  background: #1e2a1e; border: 1px solid #27ae60; border-radius: 8px;
+  padding: 12px 16px; margin: 16px 0; font-size: 1rem;
+}
+.cost-box .amount { font-size: 1.4rem; font-weight: 700; color: #27ae60; }
+
+/* Progress */
+.progress-bar-wrap {
+  background: #222; border-radius: 4px; height: 8px; margin: 8px 0; overflow: hidden;
+}
+.progress-bar {
+  height: 100%; background: #4f8cff; transition: width 0.3s; border-radius: 4px;
+}
+.status-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
+  font-weight: 600; text-transform: uppercase;
+}
+.status-badge.generating { background: #2d3748; color: #4f8cff; }
+.status-badge.done { background: #1e2a1e; color: #27ae60; }
+.status-badge.error { background: #2a1e1e; color: #e74c3c; }
+
+.video-player { margin-top: 16px; }
+.video-player video { width: 100%; border-radius: 8px; }
+
+.error-msg { color: #e74c3c; background: #2a1e1e; padding: 12px; border-radius: 6px; margin: 12px 0; }
+
+.hidden { display: none !important; }
+
+.actions { display: flex; gap: 8px; margin-top: 16px; }

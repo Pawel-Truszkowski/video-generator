@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Generator</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Video Generator</h1>
+    <p class="subtitle">Generuj film ze zdjec i opisu</p>
+
+    <!-- SCREEN 1: Upload form -->
+    <div id="screen-form">
+      <div class="form-group">
+        <label>Zdjecia</label>
+        <div class="dropzone" id="dropzone">
+          <p>Przeciagnij zdjecia lub kliknij aby wybrac</p>
+          <input type="file" id="file-input" multiple accept="image/jpeg,image/png,image/webp">
+        </div>
+        <div class="previews" id="previews"></div>
+      </div>
+
+      <div class="form-group">
+        <label>Opis filmu</label>
+        <textarea id="prompt" placeholder="Opisz jaki film chcesz wygenerowac..."></textarea>
+      </div>
+
+      <div class="row">
+        <div class="form-group">
+          <label>Model</label>
+          <select id="model">
+            <option value="wan">Wan (~$0.05/s)</option>
+            <option value="kling-2.5-turbo">Kling 2.5 Turbo (~$0.07/s)</option>
+            <option value="veo-3.1-fast">Veo 3.1 Fast (~$0.10/s)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Dlugosc: <span id="duration-label">60s</span></label>
+          <input type="range" id="duration" min="10" max="180" step="5" value="60">
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn-primary" id="btn-plan" disabled>Zaplanuj</button>
+      </div>
+    </div>
+
+    <!-- SCREEN 2: Plan review -->
+    <div id="screen-plan" class="hidden">
+      <h2>Plan scen</h2>
+      <div id="scenes-list"></div>
+      <div class="actions" style="margin-bottom: 12px;">
+        <button class="btn-primary" id="btn-add-scene">+ Dodaj scene</button>
+      </div>
+      <div class="cost-box">
+        Szacowany koszt: <span class="amount" id="cost-amount">$0.00</span>
+        <span id="total-duration" style="margin-left: 16px; color: #aaa;"></span>
+      </div>
+      <div class="actions">
+        <button class="btn-success" id="btn-generate">Generuj film</button>
+        <button class="btn-danger" id="btn-back">Wstecz</button>
+      </div>
+    </div>
+
+    <!-- SCREEN 3: Progress & result -->
+    <div id="screen-progress" class="hidden">
+      <h2>Generowanie</h2>
+      <div id="progress-status">
+        <span class="status-badge generating" id="status-text">Generowanie...</span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+      </div>
+      <p id="progress-detail" style="font-size: 0.85rem; color: #888; margin-top: 8px;"></p>
+
+      <div id="error-box" class="error-msg hidden"></div>
+
+      <div id="video-result" class="video-player hidden">
+        <video controls id="final-video"></video>
+        <div class="actions" style="margin-top:8px;">
+          <a id="download-link" class="btn-primary" style="text-decoration:none; text-align:center;" download>Pobierz MP4</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
