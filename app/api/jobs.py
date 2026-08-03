@@ -2,22 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 import uuid
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
+import aiosqlite
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from app.auth.deps import get_owned_job, require_user
 from app.config import settings
 from app.db import get_db
 from app.graph.pipeline import get_event_queue, run_generation, run_planning
 
-router = APIRouter()
+# Every route here requires a session by construction, so a future route added to
+# this router cannot accidentally be left public. Ownership of a specific job is
+# a separate check — see Depends(get_owned_job).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # In-memory state cache for running jobs
 _job_states: dict[str, dict] = {}
+
+THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
 @router.post("/jobs")
@@ -27,6 +35,7 @@ async def create_job(
     model: str = Form("wan"),
     aspect_ratio: str = Form("16:9"),
     target_duration_s: int = Form(120),
+    user: aiosqlite.Row = Depends(require_user),
 ):
     job_id = uuid.uuid4().hex[:12]
     upload_dir = os.path.join(settings.data_dir, "uploads", job_id)
@@ -48,21 +57,56 @@ async def create_job(
 
     db = await get_db()
     await db.execute(
-        "INSERT INTO jobs (id, status, prompt, model, aspect_ratio, target_duration_s) VALUES (?, ?, ?, ?, ?, ?)",
-        (job_id, "uploaded", prompt, model, aspect_ratio, target_duration_s),
+        "INSERT INTO jobs (id, status, prompt, model, aspect_ratio, target_duration_s, "
+        "user_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        (job_id, "uploaded", prompt, model, aspect_ratio, target_duration_s, user["id"]),
     )
     await db.commit()
 
     return {"job_id": job_id}
 
 
-@router.post("/jobs/{job_id}/plan")
-async def plan_job(job_id: str):
+@router.get("/jobs")
+async def list_jobs(
+    user: aiosqlite.Row = Depends(require_user),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Read-only list for the 'Moje filmy' screen."""
     db = await get_db()
-    row = await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
-    job = await row.fetchone()
-    if not job:
-        raise HTTPException(404, "Job not found")
+    rows = await db.execute(
+        "SELECT j.id, j.status, j.prompt, j.model, j.est_cost_usd, j.created_at, j.error, "
+        "       COUNT(s.id) AS scene_count, "
+        "       COALESCE(SUM(s.duration_s), 0) AS total_duration_s "
+        "  FROM jobs j "
+        "  LEFT JOIN scenes s ON s.job_id = j.id "
+        " WHERE j.user_id = ? "
+        " GROUP BY j.id "
+        " ORDER BY j.created_at DESC, j.id DESC "
+        " LIMIT ? OFFSET ?",
+        (user["id"], limit, offset),
+    )
+
+    jobs = []
+    for row in await rows.fetchall():
+        job = dict(row)
+        job["thumb_url"] = f"/jobs/{row['id']}/thumbnail"
+        # stat per row (cheap at limit<=200) so the UI never renders a download
+        # button for a job whose mp4 has been cleaned off disk.
+        final_path = os.path.join(settings.data_dir, "final", f"{row['id']}.mp4")
+        job["video_url"] = (
+            f"/media/{row['id']}/final.mp4"
+            if row["status"] == "done" and os.path.exists(final_path)
+            else None
+        )
+        jobs.append(job)
+
+    return {"jobs": jobs}
+
+
+@router.post("/jobs/{job_id}/plan")
+async def plan_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     if job["status"] not in ("uploaded", "error"):
         raise HTTPException(400, f"Job is already in status: {job['status']}")
 
@@ -92,12 +136,7 @@ async def plan_job(job_id: str):
 
 
 @router.post("/jobs/{job_id}/generate")
-async def generate_job(job_id: str):
-    db = await get_db()
-    row = await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
-    job = await row.fetchone()
-    if not job:
-        raise HTTPException(404, "Job not found")
+async def generate_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     if job["status"] != "planned":
         raise HTTPException(400, f"Job must be in 'planned' status, got: {job['status']}")
 
@@ -112,7 +151,13 @@ async def generate_job(job_id: str):
 
 
 @router.post("/jobs/{job_id}/scenes/{idx}/update")
-async def update_scene(job_id: str, idx: int, sub_prompt: str = Form(...), duration_s: int = Form(...)):
+async def update_scene(
+    job_id: str,
+    idx: int,
+    sub_prompt: str = Form(...),
+    duration_s: int = Form(...),
+    job: aiosqlite.Row = Depends(get_owned_job),
+):
     """Allow user to edit a scene's sub_prompt or duration before generation."""
     state = _job_states.get(job_id)
     if not state or not state.get("scenes"):
@@ -157,7 +202,11 @@ class SyncScenesRequest(BaseModel):
 
 
 @router.post("/jobs/{job_id}/scenes/sync")
-async def sync_scenes(job_id: str, body: SyncScenesRequest):
+async def sync_scenes(
+    job_id: str,
+    body: SyncScenesRequest,
+    job: aiosqlite.Row = Depends(get_owned_job),
+):
     """Replace the entire scene list (add/remove/reorder scenes)."""
     state = _job_states.get(job_id)
     if not state:
@@ -193,13 +242,8 @@ async def sync_scenes(job_id: str, body: SyncScenesRequest):
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: str):
+async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     db = await get_db()
-    row = await db.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
-    job = await row.fetchone()
-    if not job:
-        raise HTTPException(404, "Job not found")
-
     scenes_rows = await db.execute(
         "SELECT * FROM scenes WHERE job_id=? ORDER BY idx", (job_id,)
     )
@@ -213,13 +257,43 @@ async def get_job(job_id: str):
         "aspect_ratio": job["aspect_ratio"],
         "target_duration_s": job["target_duration_s"],
         "est_cost_usd": job["est_cost_usd"],
+        "created_at": job["created_at"],
         "error": job["error"],
         "scenes": scenes,
     }
 
 
+@router.get("/jobs/{job_id}/thumbnail")
+async def get_job_thumbnail(job: aiosqlite.Row = Depends(get_owned_job)):
+    """First uploaded image, for the 'Moje filmy' list.
+
+    Serves from data/uploads/ rather than data/frames/ because uploads exist for
+    every job while frames only exist for chained ones. The directory is built
+    from job["id"] (a DB value) and no filename ever comes from the client, so
+    there is no traversal surface.
+    """
+    upload_dir = os.path.join(settings.data_dir, "uploads", job["id"])
+    if not os.path.isdir(upload_dir):
+        raise HTTPException(404, "Brak miniaturki")
+
+    entries = sorted(f for f in os.listdir(upload_dir) if f.lower().endswith(THUMB_EXTS))
+    if not entries:
+        raise HTTPException(404, "Brak miniaturki")
+
+    # Prefer the letterboxed JPEG written by graph/nodes/validate.py.
+    processed = [f for f in entries if f.endswith("_processed.jpg")]
+    path = os.path.join(upload_dir, processed[0] if processed else entries[0])
+
+    return FileResponse(
+        path,
+        media_type=mimetypes.guess_type(path)[0] or "image/jpeg",
+        # "private" stops a shared proxy serving one user's thumbnail to another.
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 @router.get("/jobs/{job_id}/events")
-async def job_events(job_id: str):
+async def job_events(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     queue = get_event_queue(job_id)
 
     async def event_generator():
@@ -234,8 +308,9 @@ async def job_events(job_id: str):
 
 
 @router.get("/media/{job_id}/final.mp4")
-async def get_final_video(job_id: str):
-    path = os.path.join(settings.data_dir, "final", f"{job_id}.mp4")
+async def get_final_video(job: aiosqlite.Row = Depends(get_owned_job)):
+    # Path built from job["id"], never the raw path param.
+    path = os.path.join(settings.data_dir, "final", f"{job['id']}.mp4")
     if not os.path.exists(path):
         raise HTTPException(404, "Video not found")
-    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}.mp4")
+    return FileResponse(path, media_type="video/mp4", filename=f"{job['id']}.mp4")

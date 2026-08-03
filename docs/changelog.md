@@ -1,5 +1,99 @@
 # Changelog
 
+## [0.2.0] — 2026-08-01 — Logowanie i konta uzytkownikow (roadmap Faza 2.1 + 2.2)
+
+Do tej pory kazdy kto znal 12-znakowy `job_id` mogl czytac cudze prompty, edytowac
+sceny, pobierac filmy i — przez `POST /jobs/{id}/generate` — wydawac cudze pieniadze
+na fal.ai. Teraz kazdy job ma wlasciciela.
+
+### Logowanie (magic link, bez hasel)
+- `POST /auth/request-login` — podajesz email, dostajesz jednorazowy link (wazny 15 min)
+  - Rejestracja = logowanie: nie da sie sprawdzic czy dany email ma konto
+  - Rate limit: 3 proby / 15 min na email, 10 / 15 min na IP (in-process, bez Redisa)
+- `GET /auth/callback?token=...` — ustawia ciasteczko sesji, przekierowuje na `/`
+- `GET /auth/me` — kto jest zalogowany (bootstrap frontendu)
+- `POST /auth/logout` — czysci ciasteczko (idempotentne)
+
+### Tokeny
+- Magic link: `secrets.token_urlsafe(32)`, w bazie tylko SHA-256 — wyciek bazy nie daje
+  dzialajacych linkow
+- Jednorazowosc przez atomowy `UPDATE ... WHERE used_at IS NULL` + `rowcount`
+  (SELECT-potem-UPDATE bylby wyscigiem nawet na jednym polaczeniu)
+- Nowy link uniewaznia poprzedni — w danym momencie zyje max 1 token na uzytkownika
+- Sesja: `v1.<payload>.<HMAC-SHA256>`, termin waznosci **w podpisanym payloadzie**
+  (samo `Max-Age` ciasteczka klient moze zignorowac)
+- Ciasteczko: `HttpOnly`, `SameSite=Lax`, `Secure` sterowane przez `COOKIE_SECURE`
+  - `Lax` a nie `Strict`, bo klikniecie linku z poczty to nawigacja cross-site
+  - Ciasteczko (a nie naglowek `Authorization`), bo `EventSource` nie umie ustawiac
+    naglowkow — SSE dziala bez zmian w kodzie frontendu
+
+### Autoryzacja
+- `APIRouter(dependencies=[Depends(require_user)])` — kazda obecna i przyszla trasa
+  w `jobs.py` jest chroniona z automatu
+- `get_owned_job` — jedno miejsce sprawdzajace wlasnosc, uzyte przez wszystkie 8 tras
+  - Zwraca **404, nie 403**, z tym samym komunikatem dla "nie istnieje" i "nie twoje",
+    zeby `GET /jobs/<zgadywanka>` nie byl wyrocznia o istnieniu jobow
+  - Walidacja `^[0-9a-f]{12}$` + budowanie sciezek z `job["id"]` zamyka path traversal
+    w `/media/{job_id}/final.mp4`
+- `/scenes/{idx}/update` i `/scenes/sync` w ogole nie dotykaly bazy — teraz sprawdzaja
+  wlasciciela
+
+### Nowe endpointy
+- `GET /jobs` — lista jobow uzytkownika (+ liczba scen, laczny czas, `video_url`
+  tylko gdy plik faktycznie istnieje na dysku)
+- `GET /jobs/{id}/thumbnail` — miniaturka z `data/uploads/`, `Cache-Control: private`
+
+### Wysylka maili (`app/mail/`)
+- Protokol `MailSender` + dwie implementacje, wzorowane na `app/providers/`
+- `MAIL_PROVIDER=console` (domyslne) — link do logow i do odpowiedzi HTTP.
+  **Backdoor deweloperski**: podwojnie zabezpieczony (`console` + `COOKIE_SECURE=false`),
+  a start z `COOKIE_SECURE=true` + `console` konczy sie bledem
+- `MAIL_PROVIDER=resend` — Resend HTTP API
+
+### Baza danych
+- Nowe tabele `users`, `magic_tokens` (+ indeksy)
+- `jobs` dostaje `user_id` i `created_at` przez idempotentna migracje w `_migrate()`
+  (`PRAGMA table_info` → warunkowy `ALTER TABLE`), bo `CREATE TABLE IF NOT EXISTS`
+  nie dodaje kolumn do istniejacej tabeli
+- Indeks `idx_jobs_user_created` tworzony **po** migracji — w `SCHEMA` wywalilby sie
+  na `no such column: user_id` i zabral ze soba tworzenie `users`/`magic_tokens`
+- Daty jako `strftime('%Y-%m-%dT%H:%M:%SZ')` — `datetime('now')` nie ma znacznika
+  strefy i `new Date()` w przegladarce zinterpretowalby je jako czas lokalny
+- 11 istniejacych jobow ma `user_id = NULL` → sa niewidoczne dla wszystkich
+  (`WHERE user_id = ?` nigdy nie trafia w NULL). Nikt nie zostanie obciazony
+  za juz wydane pieniadze.
+
+### Frontend
+- Nowe ekrany: logowanie i "Moje filmy"; `#screen-form` startuje ukryty, zeby
+  wylogowany uzytkownik nie zobaczyl mignięcia formularza
+- `showScreen()` zastepuje trzy miejsca recznie przelaczajace klase `.hidden`
+- `apiFetch()` — 401 na dowolnym wywolaniu wraca na ekran logowania zamiast cichej awarii
+  (wczesniej `catch (_) {}` przy edycji scen zjadal wszystko)
+- `errText()` wyciaga `detail` z odpowiedzi FastAPI, w tym komunikat walidacji z 422
+- Wylogowanie czysci `files`/`jobId`/`currentScenes` — inaczej kolejny uzytkownik
+  na tej samej przegladarce odziedziczylby wgrane zdjecia poprzednika
+- Obsluga 401 na strumieniu SSE (wczesniej ekran postepu wisialby w nieskonczonosc)
+
+### Konfiguracja
+- Nowe: `MAIL_PROVIDER`, `RESEND_API_KEY`, `MAIL_FROM`, `BASE_URL`, `SESSION_SECRET`,
+  `COOKIE_SECURE`
+- Brak `SESSION_SECRET` → staly sekret deweloperski + ostrzezenie (staly, nie losowy:
+  losowy wylogowywalby wszystkich przy kazdym restarcie)
+- Start aplikacji przerywany gdy: `COOKIE_SECURE=true` bez `SESSION_SECRET`,
+  `COOKIE_SECURE=true` z `MAIL_PROVIDER=console`, albo `resend` bez klucza API
+- Nowa zaleznosc: `httpx` (tylko do Resend). Sesje i tokeny na samej bibliotece
+  standardowej — bez `pyjwt`, `passlib`, `itsdangerous`
+
+### Znane ograniczenia
+- Rate limit trzymany w pamieci procesu (reset po restarcie); za reverse proxy
+  `request.client.host` to IP proxy, wiec Faza 4 musi wlaczyc `--proxy-headers`
+- Skanery linkow w firmowej poczcie (np. Outlook Safe Links) moga "kliknac" link
+  zanim zrobi to czlowiek i go zuzyc. Nie wystepuje przy `MAIL_PROVIDER=console`.
+- "Moje filmy" jest tylko do odczytu — wznowienie niedokonczonego joba wymaga
+  przeniesienia `_job_states` do bazy (Faza 1.1)
+- `PRAGMA foreign_keys` nadal wylaczone, wiec `REFERENCES` jest dekoracyjne
+- Brak panelu admina (Faza 2.3) i platnosci (Faza 3)
+
 ## [0.1.0] — 2026-07-28 — POC
 
 Pierwsza dzialajaca wersja. Caly flow od uploadu zdjec do pobrania gotowego MP4.

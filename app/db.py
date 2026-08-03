@@ -29,7 +29,61 @@ CREATE TABLE IF NOT EXISTS scenes (
     clip_path TEXT,
     fal_request_id TEXT
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at TEXT NOT NULL,
+    last_login_at TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS magic_tokens (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_magic_tokens_user ON magic_tokens(user_id);
 """
+
+# Indexes that reference columns added by _migrate(). These MUST run after the
+# ALTERs — inside SCHEMA they would fail with "no such column: user_id" on an
+# existing DB and abort the whole executescript, taking the CREATE TABLEs with it.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_jobs_user_created ON jobs(user_id, created_at DESC);
+"""
+
+
+async def _column_names(db: aiosqlite.Connection, table: str) -> set[str]:
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    return {row["name"] for row in await cur.fetchall()}
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    """Idempotent additive migrations. Safe to run on every startup.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so new columns on
+    `jobs` must be added here rather than in SCHEMA. Note SQLite's ALTER TABLE
+    ADD COLUMN cannot take an expression default, hence nullable + backfill.
+    """
+    cols = await _column_names(db, "jobs")
+
+    if "user_id" not in cols:
+        # No default: pre-existing jobs stay NULL, so `WHERE user_id = ?` never
+        # matches them and they are invisible to every user.
+        await db.execute("ALTER TABLE jobs ADD COLUMN user_id TEXT REFERENCES users(id)")
+
+    if "created_at" not in cols:
+        await db.execute("ALTER TABLE jobs ADD COLUMN created_at TEXT")
+        await db.execute(
+            "UPDATE jobs SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE created_at IS NULL"
+        )
+
+    await db.commit()
 
 
 async def get_db() -> aiosqlite.Connection:
@@ -37,7 +91,10 @@ async def get_db() -> aiosqlite.Connection:
     if _db is None:
         _db = await aiosqlite.connect(settings.db_path)
         _db.row_factory = aiosqlite.Row
-        await _db.executescript(SCHEMA)
+        await _db.executescript(SCHEMA)   # tables only
+        await _db.commit()
+        await _migrate(_db)               # additive ALTERs + backfill
+        await _db.executescript(INDEXES)  # indexes depending on the new columns
         await _db.commit()
     return _db
 

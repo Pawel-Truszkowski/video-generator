@@ -4,6 +4,7 @@
   let jobId = null;
   let eventSource = null;
   let currentScenes = [];
+  let currentUser = null;
 
   // Elements
   const dropzone = document.getElementById('dropzone');
@@ -31,6 +32,76 @@
   const videoResult = document.getElementById('video-result');
   const finalVideo = document.getElementById('final-video');
   const downloadLink = document.getElementById('download-link');
+
+  // Auth + "Moje filmy"
+  const userBar = document.getElementById('user-bar');
+  const userEmail = document.getElementById('user-email');
+  const btnMyVideos = document.getElementById('btn-my-videos');
+  const btnNewVideo = document.getElementById('btn-new-video');
+  const btnLogout = document.getElementById('btn-logout');
+  const screenLogin = document.getElementById('screen-login');
+  const screenJobs = document.getElementById('screen-jobs');
+  const loginEmail = document.getElementById('login-email');
+  const btnLogin = document.getElementById('btn-login');
+  const loginInfo = document.getElementById('login-info');
+  const loginDevlink = document.getElementById('login-devlink');
+  const loginError = document.getElementById('login-error');
+  const jobsList = document.getElementById('jobs-list');
+  const jobsEmpty = document.getElementById('jobs-empty');
+  const btnJobsNew = document.getElementById('btn-jobs-new');
+
+  // Screens are mutually exclusive; showScreen is the only thing that toggles them.
+  const SCREEN_IDS = ['screen-login', 'screen-form', 'screen-plan', 'screen-progress', 'screen-jobs'];
+
+  function showScreen(id) {
+    SCREEN_IDS.forEach(s => {
+      document.getElementById(s).classList.toggle('hidden', s !== id);
+    });
+    userBar.classList.toggle('hidden', !currentUser);
+  }
+
+  // Every authenticated call goes through this so a 401 can never fail silently.
+  async function apiFetch(url, opts) {
+    const res = await fetch(url, opts);
+    if (res.status === 401) {
+      onLoggedOut();
+      throw new Error('UNAUTHORIZED');
+    }
+    return res;
+  }
+
+  // FastAPI returns {"detail": ...}: a string for HTTPException, but an array of
+  // validation objects for 422 — pull the message out of those rather than
+  // dumping raw JSON at the user.
+  async function errText(res) {
+    try {
+      const j = await res.json();
+      if (typeof j.detail === 'string') return j.detail;
+      if (Array.isArray(j.detail) && j.detail.length) {
+        // Pydantic prefixes custom validator messages with "Value error, ".
+        return j.detail
+          .map(d => String(d.msg || '').replace(/^Value error,\s*/, ''))
+          .filter(Boolean)
+          .join('; ') || 'Nieprawidlowe dane.';
+      }
+      return JSON.stringify(j.detail || j);
+    } catch (_) {
+      return await res.text();
+    }
+  }
+
+  function onLoggedOut() {
+    currentUser = null;
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    // Must clear staged work too, or the next user on this browser inherits the
+    // previous user's uploads and job id.
+    jobId = null;
+    files = [];
+    currentScenes = [];
+    renderPreviews();
+    updatePlanButton();
+    showScreen('screen-login');
+  }
 
   // Duration slider
   durationEl.addEventListener('input', () => {
@@ -98,17 +169,20 @@
     fd.append('target_duration_s', durationEl.value);
 
     try {
-      const res = await fetch('/jobs', { method: 'POST', body: fd });
-      if (!res.ok) throw new Error(await res.text());
+      const res = await apiFetch('/jobs', { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(await errText(res));
       const data = await res.json();
       jobId = data.job_id;
 
       connectSSE();
-      await fetch(`/jobs/${jobId}/plan`, { method: 'POST' });
+      const planRes = await apiFetch(`/jobs/${jobId}/plan`, { method: 'POST' });
+      if (!planRes.ok) throw new Error(await errText(planRes));
     } catch (e) {
-      alert('Blad: ' + e.message);
-      btnPlan.disabled = false;
-      btnPlan.textContent = 'Zaplanuj';
+      if (e.message !== 'UNAUTHORIZED') {
+        alert('Blad: ' + e.message);
+        btnPlan.disabled = false;
+        btnPlan.textContent = 'Zaplanuj';
+      }
     }
   });
 
@@ -133,11 +207,23 @@
       showDone(data.final_path);
     });
 
-    eventSource.addEventListener('error', e => {
-      try {
-        const data = JSON.parse(e.data);
-        showError(data.error);
-      } catch (_) {}
+    eventSource.addEventListener('error', async e => {
+      // This listener is overloaded: it fires both for pipeline errors (which
+      // carry e.data) and for EventSource connection failures (which do not).
+      if (e.data) {
+        try {
+          showError(JSON.parse(e.data).error);
+        } catch (_) {}
+        return;
+      }
+      // No payload + closed stream means the connection was rejected. If that
+      // was a 401, fall back to the login screen instead of hanging forever.
+      if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+        try {
+          const res = await fetch('/auth/me');
+          if (res.status === 401) onLoggedOut();
+        } catch (_) {}
+      }
     });
   }
 
@@ -171,9 +257,7 @@
   }
 
   function showPlanScreen(cost) {
-    screenForm.classList.add('hidden');
-    screenPlan.classList.remove('hidden');
-    screenProgress.classList.add('hidden');
+    showScreen('screen-plan');
     renderScenes();
     recalcCost();
     btnPlan.disabled = false;
@@ -299,13 +383,13 @@
     fd.append('sub_prompt', s.sub_prompt);
     fd.append('duration_s', s.duration_s);
     try {
-      await fetch(`/jobs/${jobId}/scenes/${idx}/update`, { method: 'POST', body: fd });
-    } catch (_) {}
+      await apiFetch(`/jobs/${jobId}/scenes/${idx}/update`, { method: 'POST', body: fd });
+    } catch (_) {}  // apiFetch has already switched screens on 401
   }
 
   async function syncAllScenes() {
     try {
-      await fetch(`/jobs/${jobId}/scenes/sync`, {
+      await apiFetch(`/jobs/${jobId}/scenes/sync`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenes: currentScenes }),
@@ -319,8 +403,7 @@
     await syncAllScenes();
 
     btnGenerate.disabled = true;
-    screenPlan.classList.add('hidden');
-    screenProgress.classList.remove('hidden');
+    showScreen('screen-progress');
     errorBox.classList.add('hidden');
     videoResult.classList.add('hidden');
     progressBar.style.width = '30%';
@@ -328,17 +411,16 @@
     statusText.className = 'status-badge generating';
 
     try {
-      const res = await fetch(`/jobs/${jobId}/generate`, { method: 'POST' });
-      if (!res.ok) throw new Error(await res.text());
+      const res = await apiFetch(`/jobs/${jobId}/generate`, { method: 'POST' });
+      if (!res.ok) throw new Error(await errText(res));
     } catch (e) {
-      showError(e.message);
+      if (e.message !== 'UNAUTHORIZED') showError(e.message);
     }
   });
 
   // Back
   btnBack.addEventListener('click', () => {
-    screenPlan.classList.add('hidden');
-    screenForm.classList.remove('hidden');
+    showScreen('screen-form');
   });
 
   function showDone(finalPath) {
@@ -359,4 +441,205 @@
     statusText.className = 'status-badge error';
     progressBar.style.width = '0%';
   }
+
+  // ---------------------------------------------------------------- Auth ----
+
+  async function doLogin() {
+    const email = loginEmail.value.trim();
+    loginError.classList.add('hidden');
+    loginInfo.classList.add('hidden');
+    loginDevlink.classList.add('hidden');
+
+    if (!email) {
+      loginError.textContent = 'Podaj adres email.';
+      loginError.classList.remove('hidden');
+      return;
+    }
+
+    btnLogin.disabled = true;
+    btnLogin.textContent = 'Wysylanie...';
+    try {
+      const res = await fetch('/auth/request-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      if (!res.ok) {
+        loginError.textContent = await errText(res);
+        loginError.classList.remove('hidden');
+        return;
+      }
+      const data = await res.json();
+      loginInfo.textContent = 'Wyslalismy link do logowania na podany adres. Sprawdz skrzynke.';
+      loginInfo.classList.remove('hidden');
+      // Only present when MAIL_PROVIDER=console — lets dev finish the loop in one click.
+      if (data.login_url) {
+        loginDevlink.href = data.login_url;
+        loginDevlink.classList.remove('hidden');
+      }
+    } catch (e) {
+      loginError.textContent = 'Blad polaczenia: ' + e.message;
+      loginError.classList.remove('hidden');
+    } finally {
+      btnLogin.disabled = false;
+      btnLogin.textContent = 'Wyslij link do logowania';
+    }
+  }
+
+  btnLogin.addEventListener('click', doLogin);
+  loginEmail.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+  btnLogout.addEventListener('click', async () => {
+    try { await fetch('/auth/logout', { method: 'POST' }); } catch (_) {}
+    onLoggedOut();
+  });
+
+  // ---------------------------------------------------------- Moje filmy ----
+
+  const STATUS_LABELS = {
+    uploaded: 'Wgrane', planning: 'Planowanie', planned: 'Zaplanowane',
+    generating: 'Generowanie', stitching: 'Laczenie', done: 'Gotowe', error: 'Blad',
+  };
+
+  function statusClass(s) {
+    if (s === 'done') return 'done';
+    if (s === 'error') return 'error';
+    if (s === 'uploaded' || s === 'planned') return 'planned';
+    return 'generating';
+  }
+
+  function fmtDuration(totalS) {
+    const m = Math.floor(totalS / 60);
+    const s = totalS % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  function renderJobCard(job) {
+    const card = document.createElement('div');
+    card.className = 'job-card';
+
+    const img = document.createElement('img');
+    img.className = 'job-thumb';
+    img.loading = 'lazy';
+    img.src = job.thumb_url;
+    // Thumbnails legitimately 404 once uploads have been cleaned off disk.
+    img.onerror = () => {
+      const ph = document.createElement('div');
+      ph.className = 'thumb-placeholder';
+      ph.textContent = 'brak';
+      img.replaceWith(ph);
+    };
+
+    const info = document.createElement('div');
+    info.className = 'job-info';
+
+    const prompt = document.createElement('div');
+    prompt.className = 'job-prompt';
+    prompt.textContent = job.prompt;
+
+    const meta = document.createElement('div');
+    meta.className = 'job-meta';
+
+    const badge = document.createElement('span');
+    badge.className = 'status-badge ' + statusClass(job.status);
+    badge.textContent = STATUS_LABELS[job.status] || job.status;
+    meta.appendChild(badge);
+
+    const date = document.createElement('span');
+    // Correct only because the API returns ISO-8601 with a trailing Z.
+    date.textContent = job.created_at ? new Date(job.created_at).toLocaleString('pl-PL') : '';
+    meta.appendChild(date);
+
+    if (job.est_cost_usd != null) {
+      const cost = document.createElement('span');
+      cost.textContent = '$' + Number(job.est_cost_usd).toFixed(2);
+      meta.appendChild(cost);
+    }
+
+    if (job.scene_count) {
+      const scenes = document.createElement('span');
+      scenes.textContent = `${job.scene_count} scen / ${fmtDuration(job.total_duration_s || 0)}`;
+      meta.appendChild(scenes);
+    }
+
+    info.appendChild(prompt);
+    info.appendChild(meta);
+
+    if (job.video_url) {
+      const actions = document.createElement('div');
+      actions.className = 'job-actions';
+
+      const play = document.createElement('button');
+      play.className = 'btn-link';
+      play.textContent = 'Odtworz';
+      play.onclick = () => {
+        if (card.querySelector('video')) return;
+        const v = document.createElement('video');
+        v.controls = true;
+        v.src = job.video_url;
+        info.appendChild(v);
+        play.disabled = true;
+      };
+
+      const dl = document.createElement('a');
+      dl.className = 'btn-link';
+      dl.href = job.video_url;
+      dl.download = '';
+      dl.textContent = 'Pobierz MP4';
+
+      actions.appendChild(play);
+      actions.appendChild(dl);
+      info.appendChild(actions);
+    }
+
+    card.appendChild(img);
+    card.appendChild(info);
+    return card;
+  }
+
+  async function loadJobs() {
+    jobsList.innerHTML = '';
+    jobsEmpty.classList.add('hidden');
+    try {
+      const res = await apiFetch('/jobs');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.jobs.length) {
+        jobsEmpty.classList.remove('hidden');
+        return;
+      }
+      data.jobs.forEach(j => jobsList.appendChild(renderJobCard(j)));
+    } catch (_) {}
+  }
+
+  btnMyVideos.addEventListener('click', async () => {
+    showScreen('screen-jobs');
+    await loadJobs();
+  });
+  btnJobsNew.addEventListener('click', () => showScreen('screen-form'));
+  btnNewVideo.addEventListener('click', () => showScreen('screen-form'));
+
+  // ---------------------------------------------------------------- Boot ----
+
+  (async function boot() {
+    const params = new URLSearchParams(location.search);
+    if (params.get('auth_error')) {
+      loginError.textContent = 'Link wygasl lub zostal juz uzyty. Zaloguj sie ponownie.';
+      loginError.classList.remove('hidden');
+      history.replaceState({}, '', location.pathname);  // don't re-show on refresh
+    }
+
+    // Raw fetch, not apiFetch: a 401 is the expected logged-out case here, and
+    // apiFetch would recurse into onLoggedOut().
+    try {
+      const res = await fetch('/auth/me');
+      if (res.ok) {
+        currentUser = await res.json();
+        userEmail.textContent = currentUser.email;
+        showScreen('screen-form');
+        return;
+      }
+    } catch (_) {}
+    showScreen('screen-login');
+  })();
 })();

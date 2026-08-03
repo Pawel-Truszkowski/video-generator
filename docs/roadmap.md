@@ -34,18 +34,22 @@ Zaleznosci: brak
 Priorytet: KRYTYCZNY
 Zaleznosci: brak
 
-### 2.1 Rejestracja i logowanie
-- [ ] Magic link (email) — najprostsze, bez hasel
-- [ ] Alternatywnie: Google OAuth (jesli klienci to firmy)
-- [ ] Tabela `users (id, email, created_at, is_active)`
-- [ ] JWT token w httpOnly cookie — sesja
-- [ ] Middleware FastAPI — sprawdzanie tokena na kazdym uzyciu API
+### 2.1 Rejestracja i logowanie — ZROBIONE (0.2.0)
+- [x] Magic link (email) — najprostsze, bez hasel
+- [ ] ~~Alternatywnie: Google OAuth~~ — niepotrzebne, magic link wystarcza
+- [x] Tabela `users (id, email, created_at, last_login_at, is_active)`
+- [x] Podpisane ciasteczko httpOnly — sesja
+      (HMAC-SHA256 zamiast JWT: ten sam efekt, zero nowych zaleznosci)
+- [x] ~~Middleware FastAPI~~ → `APIRouter(dependencies=[Depends(require_user)])`
+      Middleware przechwycilby tez StaticFiles i trasy logowania, wiec wymagalby
+      listy wyjatkow — a blad w takiej liscie to obejscie autoryzacji.
 
-### 2.2 Powiazanie jobow z uzytkownikiem
-- [ ] Kolumna `user_id` w tabeli `jobs`
-- [ ] Uzytkownik widzi tylko swoje joby
-- [ ] Endpoint `GET /jobs` — lista jobow danego uzytkownika
-- [ ] Strona "Moje filmy" — lista z miniaturkami, statusem, data
+### 2.2 Powiazanie jobow z uzytkownikiem — ZROBIONE (0.2.0)
+- [x] Kolumna `user_id` w tabeli `jobs`
+- [x] Uzytkownik widzi tylko swoje joby (`get_owned_job`, 404 zamiast 403)
+- [x] Endpoint `GET /jobs` — lista jobow danego uzytkownika
+- [x] Strona "Moje filmy" — lista z miniaturkami, statusem, data
+      (tylko do odczytu — wznawianie niedokonczonych jobow wymaga Fazy 1.1)
 
 ### 2.3 Prosty panel admina
 - [ ] Endpoint `GET /admin/jobs` — lista wszystkich jobow (tylko admin)

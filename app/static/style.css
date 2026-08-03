@@ -8,7 +8,7 @@ h2 { font-size: 1.2rem; margin: 16px 0 8px; color: #ccc; }
 /* Form */
 .form-group { margin-bottom: 16px; }
 label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 4px; }
-textarea, select, input[type="number"] {
+textarea, select, input[type="number"], input[type="email"], input[type="text"] {
   width: 100%; padding: 10px; border: 1px solid #333; border-radius: 6px;
   background: #1a1d27; color: #e0e0e0; font-size: 0.9rem;
 }
@@ -95,3 +95,51 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .hidden { display: none !important; }
 
 .actions { display: flex; gap: 8px; margin-top: 16px; }
+
+/* Auth / topbar */
+.topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #333;
+}
+.topbar-email { color: #888; font-size: 0.85rem; }
+.topbar-nav { display: flex; gap: 4px; }
+.btn-link {
+  background: none; color: #4f8cff; padding: 4px 8px; font-weight: 600;
+  font-size: 0.85rem; border: none; cursor: pointer;
+}
+.btn-link:hover { color: #3a75e6; text-decoration: underline; }
+.btn-link:disabled { color: #555; cursor: default; text-decoration: none; }
+.login-box { max-width: 380px; margin: 48px auto; }
+.info-msg {
+  color: #4f8cff; background: #1a2233; padding: 12px; border-radius: 6px;
+  margin: 12px 0; font-size: 0.9rem;
+}
+.dev-link { display: block; margin: 8px 0; font-size: 0.8rem; color: #4f8cff; word-break: break-all; }
+
+/* Moje filmy */
+.job-card {
+  background: #1a1d27; border: 1px solid #333; border-radius: 8px; padding: 12px;
+  margin-bottom: 8px; display: flex; gap: 12px; align-items: flex-start;
+}
+.job-thumb {
+  width: 120px; height: 68px; object-fit: cover; border-radius: 4px;
+  background: #222; flex-shrink: 0;
+}
+.thumb-placeholder {
+  width: 120px; height: 68px; border-radius: 4px; background: #222;
+  border: 1px solid #333; flex-shrink: 0; display: flex; align-items: center;
+  justify-content: center; color: #555; font-size: 0.7rem;
+}
+.job-info { flex: 1; min-width: 0; }
+.job-prompt {
+  font-size: 0.85rem; color: #e0e0e0; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.job-meta {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  margin-top: 6px; font-size: 0.75rem; color: #888;
+}
+.job-actions { display: flex; gap: 8px; margin-top: 8px; }
+.job-card video { width: 100%; margin-top: 8px; border-radius: 6px; }
+.status-badge.planned { background: #2d3748; color: #aaa; }
+.empty-state { color: #888; text-align: center; padding: 32px; }

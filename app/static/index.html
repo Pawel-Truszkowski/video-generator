@@ -8,11 +8,38 @@
 </head>
 <body>
   <div class="container">
+    <div class="topbar hidden" id="user-bar">
+      <span class="topbar-email" id="user-email"></span>
+      <span class="topbar-nav">
+        <button class="btn-link" id="btn-new-video">Nowy film</button>
+        <button class="btn-link" id="btn-my-videos">Moje filmy</button>
+        <button class="btn-link" id="btn-logout">Wyloguj</button>
+      </span>
+    </div>
+
     <h1>Video Generator</h1>
     <p class="subtitle">Generuj film ze zdjec i opisu</p>
 
+    <!-- SCREEN 0: Login -->
+    <div id="screen-login" class="hidden">
+      <div class="login-box">
+        <h2>Zaloguj sie</h2>
+        <p class="subtitle">Podaj email - wyslemy Ci link do logowania. Bez hasla.</p>
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="login-email" placeholder="twoj@email.pl" autocomplete="email">
+        </div>
+        <div class="actions">
+          <button class="btn-primary" id="btn-login">Wyslij link do logowania</button>
+        </div>
+        <div id="login-info" class="info-msg hidden"></div>
+        <a id="login-devlink" class="dev-link hidden" href="#">Link deweloperski (MAIL_PROVIDER=console)</a>
+        <div id="login-error" class="error-msg hidden"></div>
+      </div>
+    </div>
+
     <!-- SCREEN 1: Upload form -->
-    <div id="screen-form">
+    <div id="screen-form" class="hidden">
       <div class="form-group">
         <label>Zdjecia</label>
         <div class="dropzone" id="dropzone">
@@ -82,6 +109,16 @@
         <div class="actions" style="margin-top:8px;">
           <a id="download-link" class="btn-primary" style="text-decoration:none; text-align:center;" download>Pobierz MP4</a>
         </div>
+      </div>
+    </div>
+
+    <!-- SCREEN 4: My videos -->
+    <div id="screen-jobs" class="hidden">
+      <h2>Moje filmy</h2>
+      <div id="jobs-list"></div>
+      <div id="jobs-empty" class="empty-state hidden">Nie masz jeszcze zadnych filmow.</div>
+      <div class="actions">
+        <button class="btn-primary" id="btn-jobs-new">Nowy film</button>
       </div>
     </div>
   </div>

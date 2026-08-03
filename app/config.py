@@ -12,6 +12,22 @@ class Settings:
     mock_provider: bool = field(default_factory=lambda: os.getenv("MOCK_PROVIDER", "false").lower() in ("true", "1", "yes"))
     data_dir: str = field(default_factory=lambda: os.getenv("DATA_DIR", "/data"))
     db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", "/data/video_gen.db"))
+
+    # --- Auth / mail (Faza 2) ---
+    mail_provider: str = field(default_factory=lambda: os.getenv("MAIL_PROVIDER", "console"))
+    resend_api_key: str = field(default_factory=lambda: os.getenv("RESEND_API_KEY", ""))
+    mail_from: str = field(default_factory=lambda: os.getenv("MAIL_FROM", "Video Generator <onboarding@resend.dev>"))
+    base_url: str = field(default_factory=lambda: os.getenv("BASE_URL", "http://localhost:8000"))
+    session_secret: str = field(default_factory=lambda: os.getenv("SESSION_SECRET", ""))
+    cookie_secure: bool = field(default_factory=lambda: os.getenv("COOKIE_SECURE", "false").lower() in ("true", "1", "yes"))
+
+    session_cookie_name: str = "vg_session"
+    session_ttl_days: int = 30
+    magic_link_ttl_min: int = 15
+    login_rate_per_email: int = 3
+    login_rate_per_ip: int = 10
+    login_rate_window_s: int = 900
+
     max_upload_mb: int = 10
     max_images: int = 30
     semaphore_limit: int = 4
