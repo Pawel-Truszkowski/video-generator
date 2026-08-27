@@ -86,6 +86,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .status-badge.generating { background: #2d3748; color: #4f8cff; }
 .status-badge.done { background: #1e2a1e; color: #27ae60; }
 .status-badge.error { background: #2a1e1e; color: #e74c3c; }
+.status-badge.interrupted { background: #2a251e; color: #e6a23c; }
 
 .video-player { margin-top: 16px; }
 .video-player video { width: 100%; border-radius: 8px; }

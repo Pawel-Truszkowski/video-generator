@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.3.0] — 2026-08-26 — Persystencja i wznawianie jobow (roadmap Faza 1.1)
+
+Stan jobu w locie zyl w module-level diccie `_job_states`. Restart kontenera kasowal go
+w calosci: job zostawal w bazie w statusie `generating` na zawsze, `POST /generate`
+odpowiadal `400 "Job state not found"`, a uzytkownik zaczynal od zera — **placac fal.ai
+drugi raz za klipy, ktore juz lezaly na dysku**. Teraz baza jest jedynym zrodlem prawdy.
+
+### Baza jako zrodlo prawdy
+- Nowa kolumna `scenes.image_index` (migracja w `_migrate()` + backfill ze starego
+  `image_path = "image_3"`), indeks `idx_scenes_job_idx ON scenes(job_id, idx)`
+- Nowy modul `app/services/job_state.py` — jedyna granica DB ⇄ dict stanu pipeline'u.
+  Wezly (`validate`/`plan_scenes`/`generate_clips`/`stitch`) nie zmienily sygnatur
+- `image_paths` odtwarzane z `data/uploads/{job_id}/`, nie z kolumny — system plikow
+  i tak jest autorytetem, a kopia w bazie moglaby sie rozjechac po czyszczeniu (Faza 1.3)
+- `generate_clips` zapisuje kazda ukonczona scene **od razu** (callbacki `on_scene_done`
+  / `on_scene_error`), a nie po calym wezle — crash na scenie 5 zostawia sceny 0-4 zapisane
+- Przy okazji per-scenowy postep w SSE (zdarzenie `scene` z `done`/`total`)
+
+### Deterministyczne sciezki klipow
+- `VideoProvider.generate_clip` dostal argument `out_path` — providery nie losuja juz
+  wlasnych nazw `uuid4().hex`, przez ktore po restarcie nie dalo sie powiazac pliku ze scena
+- Konwencja: `data/clips/{job_id}/scene_{idx:03d}.mp4`. Retry nadpisuje w miejscu,
+  Faza 1.3 skasuje jeden katalog na joba
+- `FalProvider` pobiera film na `{out_path}.part` i robi `os.replace()` — istnienie
+  `out_path` oznacza "scena gotowa", wiec polowicznie pobrany plik nie moze tam trafic
+
+### Wznawianie
+- `reconcile_interrupted()` w `lifespan`: statusy `planning`/`generating`/`stitching`
+  to po restarcie z definicji trup → nowy status `interrupted`
+- `POST /jobs/{id}/resume` — zwraca `stage` (`planning`/`planned`/`generating`/`done`).
+  Job w statusie `planned` **nigdy** nie startuje generacji sam: to klikniecie "Generuj"
+  wydaje pieniadze. Blad w pojedynczej scenie wznawia sie jako `generating`, nie
+  `planning` — przeplanowanie skasowaloby wiersze `scenes` razem z gotowymi klipami
+- `already_rendered()` pomija scene, ktora ma `status='done'`, plik pod `out_path`
+  i niezerowy rozmiar. Baza mowi "done", a pliku nie ma → regeneracja (dysk ma ostatnie slowo)
+- Guard `_running: set[str]` przeciw podwojnemu startowi. Utrata przy restarcie jest tu
+  poprawna: po restarcie faktycznie nic nie biegnie
+- Edycja planu odrzucana (409), gdy job jest w `generating`/`stitching`/`done` **albo**
+  gdy ktorakolwiek scena ma `status='done'` — `save_scenes` robi DELETE+INSERT i skasowalaby
+  `clip_path` oplaconych klipow
+
+### UI
+- Status `interrupted` ("Przerwane", bursztynowy badge) + przycisk "Wznow" na karcie
+  w "Moje filmy"
+- Edytor planu odtwarza sie po restarcie: miniatury z `GET /jobs/{id}/images/{index}`,
+  lista w selectcie "Zdjecie" z `image_count` w `GET /jobs/{id}` (przegladarka nie ma
+  juz obiektow `File`)
+
+### Inne
+- `PYTHONUNBUFFERED=1` w `docker-compose.yml` — bez tego `print()` z pipeline'u siedzial
+  w buforze i nigdy nie trafial do `docker compose logs`
+- `MockProvider` przestal sie wywalac na promptach z `:` / `%` / `'` — `_escape_drawtext()`.
+  FFmpeg rozpakowuje filtergraph dwuprzebiegowo, wiec apostrofy same nie chronia dwukropka
+  (ani backslash sam); potrzebne sa oba naraz
+
 ## [0.2.0] — 2026-08-01 — Logowanie i konta uzytkownikow (roadmap Faza 2.1 + 2.2)
 
 Do tej pory kazdy kto znal 12-znakowy `job_id` mogl czytac cudze prompty, edytowac

@@ -5,6 +5,9 @@
   let eventSource = null;
   let currentScenes = [];
   let currentUser = null;
+  // How many source images the job has, per the API: `files` is empty after a
+  // resume, so the image picker has to count from the server instead.
+  let imageCount = 0;
 
   // Elements
   const dropzone = document.getElementById('dropzone');
@@ -262,6 +265,15 @@
     recalcCost();
     btnPlan.disabled = false;
     btnPlan.textContent = 'Zaplanuj';
+    // showProgressScreen() disables it, and a resume can land here afterwards.
+    btnGenerate.disabled = false;
+  }
+
+  /** Local File while the upload is still in this tab, server copy after a resume. */
+  function sceneImageSrc(imageIndex) {
+    if (files[imageIndex]) return URL.createObjectURL(files[imageIndex]);
+    if (jobId) return `/jobs/${jobId}/images/${imageIndex}`;
+    return '';
   }
 
   function renderScenes() {
@@ -272,9 +284,7 @@
       card.className = 'scene-card';
 
       const img = document.createElement('img');
-      if (files[s.image_index]) {
-        img.src = URL.createObjectURL(files[s.image_index]);
-      }
+      img.src = sceneImageSrc(s.image_index);
 
       const info = document.createElement('div');
       info.className = 'scene-info';
@@ -324,18 +334,15 @@
       const imgLabel = document.createElement('label');
       imgLabel.textContent = 'Zdjecie:';
       const imgSel = document.createElement('select');
-      files.forEach((f, fi) => {
+      for (let fi = 0; fi < (files.length || imageCount); fi++) {
         const opt = document.createElement('option');
         opt.value = fi; opt.textContent = `#${fi + 1}`;
         if (fi === s.image_index) opt.selected = true;
         imgSel.appendChild(opt);
-      });
+      }
       imgSel.addEventListener('change', () => {
         currentScenes[i].image_index = parseInt(imgSel.value);
-        // Update thumbnail
-        if (files[currentScenes[i].image_index]) {
-          img.src = URL.createObjectURL(files[currentScenes[i].image_index]);
-        }
+        img.src = sceneImageSrc(currentScenes[i].image_index);
       });
 
       controls.appendChild(durLabel);
@@ -402,13 +409,7 @@
     // Sync all scenes before generating
     await syncAllScenes();
 
-    btnGenerate.disabled = true;
-    showScreen('screen-progress');
-    errorBox.classList.add('hidden');
-    videoResult.classList.add('hidden');
-    progressBar.style.width = '30%';
-    statusText.textContent = 'Generowanie klipow...';
-    statusText.className = 'status-badge generating';
+    showProgressScreen();
 
     try {
       const res = await apiFetch(`/jobs/${jobId}/generate`, { method: 'POST' });
@@ -417,6 +418,16 @@
       if (e.message !== 'UNAUTHORIZED') showError(e.message);
     }
   });
+
+  function showProgressScreen(text) {
+    btnGenerate.disabled = true;
+    showScreen('screen-progress');
+    errorBox.classList.add('hidden');
+    videoResult.classList.add('hidden');
+    progressBar.style.width = '30%';
+    statusText.textContent = text || 'Generowanie klipow...';
+    statusText.className = 'status-badge generating';
+  }
 
   // Back
   btnBack.addEventListener('click', () => {
@@ -499,11 +510,17 @@
   const STATUS_LABELS = {
     uploaded: 'Wgrane', planning: 'Planowanie', planned: 'Zaplanowane',
     generating: 'Generowanie', stitching: 'Laczenie', done: 'Gotowe', error: 'Blad',
+    interrupted: 'Przerwane',
   };
+
+  // 'done' is excluded on purpose: nothing left to run, and the card already
+  // offers Odtworz/Pobierz.
+  const RESUMABLE_STATUSES = ['uploaded', 'planned', 'interrupted', 'error'];
 
   function statusClass(s) {
     if (s === 'done') return 'done';
     if (s === 'error') return 'error';
+    if (s === 'interrupted') return 'interrupted';
     if (s === 'uploaded' || s === 'planned') return 'planned';
     return 'generating';
   }
@@ -512,6 +529,61 @@
     const m = Math.floor(totalS / 60);
     const s = totalS % 60;
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  /** Pick a job back up from wherever it stopped. */
+  async function resumeJob(job) {
+    jobId = job.id;
+    // The uploads are gone from this tab; thumbnails now come from the server.
+    files = [];
+
+    let detail;
+    try {
+      const res = await apiFetch(`/jobs/${jobId}`);
+      if (!res.ok) throw new Error(await errText(res));
+      detail = await res.json();
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      return;
+    }
+
+    imageCount = detail.image_count;
+    // Narrowed to the plan-editor shape: /scenes/sync rejects the extra
+    // status/clip_path fields the DB rows carry.
+    currentScenes = detail.scenes.map(sc => ({
+      image_index: sc.image_index,
+      sub_prompt: sc.sub_prompt,
+      duration_s: sc.duration_s,
+      chain_from_prev: !!sc.chain_from_prev,
+    }));
+
+    // Subscribe before asking the server to start, so no early event is missed.
+    connectSSE();
+
+    let stage;
+    try {
+      const res = await apiFetch(`/jobs/${jobId}/resume`, { method: 'POST' });
+      if (!res.ok) throw new Error(await errText(res));
+      stage = (await res.json()).stage;
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      return;
+    }
+
+    if (stage === 'planned') {
+      showPlanScreen(detail.est_cost_usd);
+    } else if (stage === 'generating') {
+      showProgressScreen('Wznawianie generowania...');
+    } else if (stage === 'planning') {
+      // Planning is already running server-side and the SSE 'planned' event
+      // will swap this for the editor; meanwhile the user sees the click landed.
+      showProgressScreen('Planowanie scen...');
+    } else if (stage === 'done') {
+      showDone(`/media/${jobId}/final.mp4`);
+    } else {
+      // `stage` comes off the wire — never leave the user on a dead screen.
+      alert('Nieznany etap wznowienia: ' + stage);
+    }
   }
 
   function renderJobCard(job) {
@@ -565,10 +637,18 @@
     info.appendChild(prompt);
     info.appendChild(meta);
 
-    if (job.video_url) {
-      const actions = document.createElement('div');
-      actions.className = 'job-actions';
+    const actions = document.createElement('div');
+    actions.className = 'job-actions';
 
+    if (RESUMABLE_STATUSES.includes(job.status)) {
+      const resume = document.createElement('button');
+      resume.className = 'btn-link';
+      resume.textContent = 'Wznow';
+      resume.onclick = () => resumeJob(job);
+      actions.appendChild(resume);
+    }
+
+    if (job.video_url) {
       const play = document.createElement('button');
       play.className = 'btn-link';
       play.textContent = 'Odtworz';
@@ -589,8 +669,9 @@
 
       actions.appendChild(play);
       actions.appendChild(dl);
-      info.appendChild(actions);
     }
+
+    if (actions.childElementCount) info.appendChild(actions);
 
     card.appendChild(img);
     card.appendChild(info);

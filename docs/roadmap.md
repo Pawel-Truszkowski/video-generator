@@ -10,11 +10,12 @@ Cel: MVP ktore mozna pokazac klientom i pobierac oplate.
 Priorytet: KRYTYCZNY
 Zaleznosci: brak
 
-### 1.1 Persystencja stanu jobow
-- [ ] Przeniesc `_job_states` (in-memory dict) do SQLite
-- [ ] Zapisywac `scenes`, `clip_paths`, `chain_flags`, `image_paths` w DB
-- [ ] Po restarcie kontenera — mozliwosc wznowienia joba od ostatniego ukonzczonego kroku
-- [ ] Nie generowac ponownie klipow ktore juz istnieja na dysku
+### 1.1 Persystencja stanu jobow — ZROBIONE (0.3.0)
+- [x] Przeniesc `_job_states` (in-memory dict) do SQLite
+- [x] Zapisywac `scenes`, `clip_paths`, `chain_flags`, `image_paths` w DB
+      (`image_paths` odtwarzane z dysku, `clip_paths` = kolumna `scenes.clip_path`)
+- [x] Po restarcie kontenera — mozliwosc wznowienia joba od ostatniego ukonzczonego kroku
+- [x] Nie generowac ponownie klipow ktore juz istnieja na dysku
 
 ### 1.2 Obsluga bledow i retry
 - [ ] Endpoint `POST /jobs/{id}/scenes/{idx}/retry` — ponowna generacja pojedynczej sceny

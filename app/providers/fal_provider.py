@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import uuid
 
 import fal_client
 
@@ -72,6 +71,7 @@ class FalProvider:
         duration_s: int,
         aspect_ratio: str,
         model: str,
+        out_path: str,
     ) -> str:
         endpoint = settings.model_endpoints.get(model)
         if not endpoint:
@@ -102,14 +102,14 @@ class FalProvider:
             on_queue_update=on_queue_update,
         )
 
-        # Download the video
+        # Download to a temporary name and move into place only once complete:
+        # out_path existing is what a resume reads as "this scene is done".
         video_url = result["video"]["url"]
-        out_dir = os.path.join(settings.data_dir, "clips")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{uuid.uuid4().hex}.mp4")
+        tmp_path = f"{out_path}.part"
 
         import urllib.request
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, urllib.request.urlretrieve, video_url, out_path)
+        await loop.run_in_executor(None, urllib.request.urlretrieve, video_url, tmp_path)
+        os.replace(tmp_path, out_path)  # atomic within the same filesystem
 
         return out_path
