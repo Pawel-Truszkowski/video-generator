@@ -170,12 +170,20 @@ async def save_scenes(job_id: str, scenes: list[dict]) -> None:
     await db.commit()
 
 
-async def update_scene_fields(job_id: str, idx: int, sub_prompt: str, duration_s: int) -> None:
-    """Targeted edit of one scene (no DELETE, so clip_path/status survive)."""
+async def update_scene_fields(
+    job_id: str, idx: int, sub_prompt: str, duration_s: int, image_index: int
+) -> None:
+    """Targeted edit of one scene (no DELETE, so clip_path/status survive).
+
+    `image_index` is a per-scene field like the other two, so it belongs on this
+    path rather than on save_scenes: swapping a scene's source image must not
+    renumber the list or drop what the other scenes have already rendered.
+    """
     db = await get_db()
     await db.execute(
-        "UPDATE scenes SET sub_prompt = ?, duration_s = ? WHERE job_id = ? AND idx = ?",
-        (sub_prompt, duration_s, job_id, idx),
+        "UPDATE scenes SET sub_prompt = ?, duration_s = ?, image_index = ? "
+        " WHERE job_id = ? AND idx = ?",
+        (sub_prompt, duration_s, image_index, job_id, idx),
     )
     await db.commit()
 

@@ -178,9 +178,10 @@ async def update_scene(
     idx: int,
     sub_prompt: str = Form(...),
     duration_s: int = Form(...),
+    image_index: int = Form(...),
     job: aiosqlite.Row = Depends(get_owned_job),
 ):
-    """Allow user to edit a scene's sub_prompt or duration before generation."""
+    """Allow user to edit a scene's sub_prompt, duration or source image."""
     state = await job_state.load_state(job_id)
     if state is None or not state["scenes"]:
         raise HTTPException(400, "Brak planu dla tego joba")
@@ -190,12 +191,19 @@ async def update_scene(
     if idx < 0 or idx >= len(state["scenes"]):
         raise HTTPException(400, "Invalid scene index")
 
+    # Rejected here rather than in generate_clips: an out-of-range index would
+    # otherwise reach image_paths[...] inside a background task, surfacing to the
+    # user as a bare "error" status instead of a 400 on the request that caused it.
+    if image_index < 0 or image_index >= len(state["image_paths"]):
+        raise HTTPException(400, f"Nieprawidłowy indeks zdjęcia: {image_index}")
+
     state["scenes"][idx]["sub_prompt"] = sub_prompt
     state["scenes"][idx]["duration_s"] = duration_s
+    state["scenes"][idx]["image_index"] = image_index
 
     # Targeted UPDATE, not save_scenes: rewriting the whole list would reset
     # every scene's status/clip_path for a one-field edit.
-    await job_state.update_scene_fields(job_id, idx, sub_prompt, duration_s)
+    await job_state.update_scene_fields(job_id, idx, sub_prompt, duration_s, image_index)
 
     est_cost = job_state.recalc_cost(state["model"], state["scenes"])
     await job_state.set_job_cost(job_id, est_cost)

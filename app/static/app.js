@@ -343,6 +343,7 @@
       imgSel.addEventListener('change', () => {
         currentScenes[i].image_index = parseInt(imgSel.value);
         img.src = sceneImageSrc(currentScenes[i].image_index);
+        syncScenesToBackend(i);
       });
 
       controls.appendChild(durLabel);
@@ -389,6 +390,7 @@
     const fd = new FormData();
     fd.append('sub_prompt', s.sub_prompt);
     fd.append('duration_s', s.duration_s);
+    fd.append('image_index', s.image_index);
     try {
       await apiFetch(`/jobs/${jobId}/scenes/${idx}/update`, { method: 'POST', body: fd });
     } catch (_) {}  // apiFetch has already switched screens on 401

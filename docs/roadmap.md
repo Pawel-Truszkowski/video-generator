@@ -22,6 +22,17 @@ Zaleznosci: brak
 - [ ] Przycisk "Ponow" w UI przy scenie ze statusem error
 - [ ] Timeout na generacje klipu (np. 10 min) — jesli fal.ai nie odpowie, oznacz scene jako error
 - [ ] Globalny retry joba — przycisk "Wznow" jesli job upadl
+- [ ] Wyciek kolejek SSE — `get_event_queue()` (`app/graph/pipeline.py`) dopisuje kolejke
+      do `_event_queues[job_id]` przy kazdym polaczeniu i nigdy jej nie usuwa. Po
+      rozlaczeniu klienta generator w `job_events` konczy sie, ale `_emit()` dalej robi
+      `put_nowait` do osieroconej kolejki — rosnie i lista kolejek, i kazda kolejka
+      z osobna. Klucze `job_id` tez nigdy nie znikaja ze slownika.
+      Uwaga: `EventSource` wznawia polaczenie sam, wiec kazdy restart kontenera i kazde
+      odswiezenie karty dokladaja komplet nowych kolejek do tych samych jobow.
+      Fix: wyrejestrowanie kolejki w `finally` generatora, usuniecie klucza gdy lista
+      pusta, plus `maxsize` na kolejce jako bezpiecznik na wypadek przeoczonej sciezki.
+      Wazne przy retry: kazde "Ponow" to kolejna subskrypcja SSE, wiec bez tego fixa
+      Faza 1.2 zwielokrotni problem zamiast go ujawnic.
 
 ### 1.3 Czyszczenie danych
 - [ ] Task/cron kasujacy pliki (clips, uploads, frames) starsze niz 7 dni
