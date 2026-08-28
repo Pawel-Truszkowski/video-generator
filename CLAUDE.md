@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A working proof-of-concept (not the "VideoAI Studio" SaaS spec from the parent directory's docs) that turns a set of uploaded images + a text prompt into a stitched MP4. Single FastAPI container, SQLite, magic-link auth, no payments — see `docs/roadmap.md` for what's explicitly deferred (persistence of in-flight job state, credits/Stripe, admin panel, S3 storage, Celery/Redis queue) and `docs/changelog.md` for what each version shipped.
+A working proof-of-concept (not the "VideoAI Studio" SaaS spec from the parent directory's docs) that turns a set of uploaded images + a text prompt into a stitched MP4. Single FastAPI container, SQLite, magic-link auth, no payments — see `docs/roadmap.md` for what's explicitly deferred (credits/Stripe, admin panel, S3 storage, Celery/Redis queue, disk cleanup) and `docs/changelog.md` for what each version shipped.
 
 ## Commands
 
@@ -21,7 +21,9 @@ There is no local (non-Docker) run path documented and no test suite — `app.js
 
 ### Manual verification
 
-No automated tests exist. To check a change works: `docker compose up --build`, open `http://localhost:8000`, and drive the 3-screen flow (upload → plan → generate) with `MOCK_PROVIDER=true` so it costs nothing. Watch container logs for the `traceback.print_exc()` output that `pipeline.py` emits on node failure.
+No automated tests exist. To check a change works: `docker compose up --build`, open `http://localhost:8000`, log in via the magic link printed to the logs, and drive the flow (upload → plan → generate) with `MOCK_PROVIDER=true` so it costs nothing. Watch container logs for the `traceback.print_exc()` output that `pipeline.py` emits on node failure.
+
+To exercise resume, kill the container mid-generation (`docker compose restart app`) and press *Wznów* on the job in "Moje filmy" — the startup log line reports how many jobs were flagged `interrupted`.
 
 ## Auth (roadmap Faza 2, shipped in 0.2.0)
 
@@ -37,7 +39,7 @@ Schema changes to existing tables go in `_migrate()` in `app/db.py`, not in the 
 
 ## Architecture
 
-**Despite `langgraph`/`langgraph-checkpoint-sqlite` being in `requirements.txt`, the pipeline is NOT built on LangGraph** — `app/graph/pipeline.py` just calls the four node functions directly as plain async functions with manual state-dict merging and SSE event emission. There's no graph, no checkpointing, no interrupt/resume. Don't assume LangGraph APIs are in play when reading `app/graph/`.
+**Despite `langgraph`/`langgraph-checkpoint-sqlite` being in `requirements.txt`, the pipeline is NOT built on LangGraph** — `app/graph/pipeline.py` just calls the four node functions directly as plain async functions with manual state-dict merging and SSE event emission. There's no graph and no checkpointing; resume exists but is hand-rolled against SQLite (see "Job state" below), not LangGraph's `interrupt()`. Don't assume LangGraph APIs are in play when reading `app/graph/`.
 
 Request flow:
 
@@ -46,10 +48,22 @@ POST /jobs                 → save images to disk, INSERT jobs row (status=uplo
 POST /jobs/{id}/plan       → asyncio.create_task(run_planning): validate → plan_scenes
                               (status becomes 'planned', pipeline pauses for user approval)
 POST /jobs/{id}/generate   → asyncio.create_task(run_generation): generate_clips → stitch
+POST /jobs/{id}/resume     → _decide_stage() picks the stage, then starts the matching task
 GET  /jobs/{id}/events     → SSE fan-out from an in-memory asyncio.Queue per job_id
 ```
 
-The pause between planning and generation is not a real interrupt — it's just that `/plan` and `/generate` are two separate endpoints/background tasks. State in between lives in the module-level `_job_states` dict in `app/api/jobs.py` — **this is lost on process restart**, which is the #1 item in `docs/roadmap.md` Faza 1.1. When editing job state handling, know that `_job_states[job_id]` (in-memory, source of truth for an in-flight job) and the `jobs`/`scenes` SQLite rows (persisted, but only partially synced back — e.g. scene `status`/`clip_path` columns exist in the schema but are never written by the pipeline) can drift apart.
+The pause between planning and generation is not a real interrupt — it's just that `/plan` and `/generate` are two separate endpoints/background tasks. Nothing is waiting during it: the planning task has already finished, and the `state` dict it worked on is gone.
+
+### Job state (roadmap Faza 1.1, shipped in 0.3.0)
+
+**SQLite is the only source of truth for a job.** There is no in-memory job registry — the `state` dict handed to the nodes is rebuilt per background task by `load_state()` in `app/services/job_state.py`, which is the single DB ⇄ pipeline-state boundary (`save_scenes`, `update_scene_fields`, `mark_scene_done`, `clip_path_for`, `reconcile_interrupted`). Nodes still take and return plain dicts; they just don't own anything that outlives their task.
+
+Four rules that fall out of that, and are easy to break:
+
+1. **A scene is "done" if its file is on disk, not if the DB says so.** `already_rendered()` (`generate_clips.py`) requires `status='done'` **and** `os.path.exists(clip_path_for(job_id, idx))` **and** a non-zero size. `clip_path_for` is a pure function of `(job_id, idx)` → `data/clips/{job_id}/scene_{idx:03d}.mp4`; the `scenes.clip_path` column is written but deliberately never read back, because pre-0.3.0 rows point at `uuid4()` names that `stitch` would never find. Providers therefore take `out_path` from the caller and must overwrite it, so a retry is idempotent.
+2. **Persist per scene, not per node.** `generate_clips` reports each finished clip through the `on_scene_done` / `on_scene_error` callbacks; that's what makes a crash on scene 5 keep scenes 0-4 recorded (and unpaid-for a second time).
+3. **`planning`/`generating`/`stitching` can only exist while a task is alive** (`STALE_STATUSES`). `reconcile_interrupted()` runs in `lifespan` and flips any it finds to `interrupted` — safe only because this is a single uvicorn worker in a single container. `_running: set[str]` in `app/api/jobs.py` guards double-starts; losing it on restart is correct, not a bug.
+4. **A `planned` job never resumes into generation by itself.** `_decide_stage()` returns `planning`/`planned`/`generating`/`done`; only the first and third start a task, because pressing *Generuj* is what spends money. A job that failed on one scene resumes as `generating`, not `planning` — replanning calls `save_scenes`, which is DELETE+INSERT and would drop paid-for clips. For the same reason plan edits are rejected with 409 once any scene has `status='done'`, not just on job status.
 
 ### Pipeline stages (`app/graph/nodes/`)
 
@@ -60,7 +74,7 @@ The pause between planning and generation is not a real interrupt — it's just 
 
 ### Provider abstraction
 
-`app/providers/base.py` defines the `VideoProvider` Protocol (`generate_clip(image_path, prompt, duration_s, aspect_ratio, model) -> clip_path`). Two implementations: `FalProvider` (real fal.ai queue API, base64 data-URI image upload, model endpoint/cost lookup in `app/config.py`'s `model_endpoints`/`model_costs`) and `MockProvider` (ffmpeg-only, no network). `app/graph/nodes/generate_clips.py::_get_provider()` picks between them based on `settings.mock_provider` — that's the only switch point; adding a real provider means adding another class satisfying the Protocol and extending that dispatch (plus `model_endpoints`/`model_costs` entries).
+`app/providers/base.py` defines the `VideoProvider` Protocol (`generate_clip(image_path, prompt, duration_s, aspect_ratio, model, out_path) -> clip_path`; the caller owns the filename and guarantees its directory exists, so an implementation must overwrite `out_path` rather than invent a name — see rule 1 above). Two implementations: `FalProvider` (real fal.ai queue API, base64 data-URI image upload, model endpoint/cost lookup in `app/config.py`'s `model_endpoints`/`model_costs`) and `MockProvider` (ffmpeg-only, no network). `app/graph/nodes/generate_clips.py::_get_provider()` picks between them based on `settings.mock_provider` — that's the only switch point; adding a real provider means adding another class satisfying the Protocol and extending that dispatch (plus `model_endpoints`/`model_costs` entries).
 
 ### Config
 
@@ -68,7 +82,7 @@ All runtime settings are one frozen dataclass, `settings = Settings()` in `app/c
 
 ### Frontend
 
-`app/static/` is plain HTML/CSS/vanilla JS (no build step, no framework) served directly by FastAPI's `StaticFiles` mount at `/`. Three screens driven by `app.js`: upload form → scene plan editor (cost/duration recompute client-side-triggered via `/scenes/sync` and `/scenes/{idx}/update`) → progress screen consuming the SSE stream from `/jobs/{id}/events`.
+`app/static/` is plain HTML/CSS/vanilla JS (no build step, no framework) served directly by FastAPI's `StaticFiles` mount at `/`. Five mutually exclusive screens driven by `app.js`, toggled only through `showScreen()`: login → upload form → scene plan editor (cost/duration recompute client-side-triggered via `/scenes/sync` and `/scenes/{idx}/update`) → progress screen consuming the SSE stream from `/jobs/{id}/events`, plus a "Moje filmy" list. The editor holds no `File` objects after a reload, so it rebuilds its thumbnails from `GET /jobs/{id}/images/{index}` and its picker from `image_count` in `GET /jobs/{id}`. `resumeJob()` subscribes to SSE *before* calling `/resume`, so an early event can't be missed.
 
 ## Relationship to the parent directory's docs
 
