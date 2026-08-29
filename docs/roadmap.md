@@ -105,17 +105,25 @@ Zaleznosci: Faza 2 (konta uzytkownikow)
 Priorytet: WYSOKI
 Zaleznosci: Faza 1
 
-### 4.1 Serwer produkcyjny
-- [ ] VPS (Hetzner/DigitalOcean) — min. 2 vCPU, 4 GB RAM, 80 GB SSD
-- [ ] Docker Compose na serwerze (ten sam co teraz)
-- [ ] Domena + DNS
-- [ ] Caddy jako reverse proxy (automatyczny HTTPS)
-- [ ] Volume dla `/data` — persystentny miedzy deployami
+### 4.1 Serwer produkcyjny — PRZYGOTOWANE (0.4.1), wdrozenie reczne
+- [x] VPS — **Mikrus 2.1** (1 vCPU, ~1 GB RAM, ~10 GB dysku), nie Hetzner/DO.
+      Duzo ciasniej niz zakladal pierwotny wpis, stad `SEMAPHORE_LIMIT` i swap
+- [x] Osobny `docker-compose.prod.yml` (nie ten sam co lokalnie): bez bind-mounta
+      `./app`, z `restart: unless-stopped`, healthcheckiem i limitem logow
+- [x] Domena — subdomena z panelu Mikrusa wskazujaca na port 30108
+- [x] ~~Caddy jako reverse proxy~~ — HTTPS terminuje proxy Mikrusa.
+      Let's Encrypt wymagalby portow 80/443, ktorych na Mikrusie nie ma
+- [x] Volume dla `/data` — persystentny miedzy deployami (bez zmian)
+- [ ] Samo wdrozenie na serwerze — instrukcja: `docs/deployment.md`
 
 ### 4.2 Backup i monitoring
-- [ ] Backup SQLite co 24h (kopia na S3 lub osobny dysk)
-- [ ] Logi do pliku + rotacja (logrotate)
-- [ ] Healthcheck endpoint `GET /health`
+- [x] Backup SQLite co 24h — `scripts/backup-db.sh` (cron), `sqlite3.backup()`
+      zamiast `cp`, rotacja 7 dni. **Kopia ladzie na tym samym dysku** — chroni
+      przed uszkodzeniem bazy, nie przed utrata VPS-a
+- [x] ~~Logi do pliku + rotacja (logrotate)~~ — `json-file` z `max-size: 10m`,
+      `max-file: 3`. Logrotate nie jest potrzebny, docker rotuje sam
+- [x] Healthcheck endpoint `GET /health` — sprawdza baze (`SELECT 1` z wlasnym
+      timeoutem) i wolne miejsce w `data_dir`; 503 gdy ktorykolwiek zawiedzie
 - [ ] Powiadomienie (email/Slack) gdy job upadnie
 
 ### 4.3 Deploy flow

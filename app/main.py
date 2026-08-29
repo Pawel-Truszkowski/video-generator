@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import get_db, close_db
@@ -45,6 +48,13 @@ async def lifespan(app: FastAPI):
     await close_db()
 
 
+# Prog wolnego miejsca w data_dir. 500 MB to okolo jednego joba z zapasem:
+# uploady + wersje _processed + klatki + klipy per scena + gotowy film.
+MIN_FREE_DISK_MB = 500
+# Musi zmiescic sie w `timeout: 10s` healthchecku z docker-compose.prod.yml.
+DB_CHECK_TIMEOUT_S = 3.0
+
+
 app = FastAPI(title="Video Generator POC", lifespan=lifespan)
 
 app.include_router(auth_router)
@@ -61,8 +71,57 @@ async def health():
     Uwaga na kontrakt: docker sam z siebie NIE restartuje kontenera oznaczonego
     jako unhealthy (robi to tylko swarm) - `docker compose ps` po prostu pokaze
     stan. Wiec falszywy alarm nie kladzie aplikacji.
+
+    Sprawdzane sa dwie rzeczy, ktore moga byc zepsute przy zywym procesie
+    uvicorna: baza i wolne miejsce w `data_dir`. Odpowiedz zawsze niesie oba
+    pomiary - 503 mowi "cos nie gra", a cialo odpowiedzi mowi co, bez wchodzenia
+    na serwer.
     """
-    # TODO(human)
+    checks: dict[str, object] = {}
+    healthy = True
+
+    # Baza. Wlasny timeout, KROTSZY niz `timeout: 10s` w healthchecku compose:
+    # SQLite w jednym procesie potrafi sie zablokowac pod obciazeniem ffmpeg,
+    # a healthcheck ma wtedy dostac czytelne "db: timeout", nie zostac urwany
+    # w polowie przez dockera.
+    try:
+        db = await get_db()
+        cur = await asyncio.wait_for(db.execute("SELECT 1"), timeout=DB_CHECK_TIMEOUT_S)
+        try:
+            await cur.fetchone()
+        finally:
+            await cur.close()
+        checks["db"] = "ok"
+    except asyncio.TimeoutError:
+        checks["db"] = f"timeout po {DB_CHECK_TIMEOUT_S}s"
+        healthy = False
+    except Exception as exc:  # plik bazy zniknal, wolumin niezamontowany, I/O error
+        checks["db"] = f"{type(exc).__name__}: {exc}"
+        healthy = False
+
+    # Dysk. Realne ryzyko tego wdrozenia: czyszczenie plikow nie jest
+    # zaimplementowane (roadmap Faza 1.3), a jeden job zostawia oryginaly,
+    # wersje _processed, klatki, klipy i gotowy film. Prog jest twardy, bo
+    # ponizej niego generacja i tak padnie - lepiej wiedziec przed, niz
+    # zbierac polowe klipow po.
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+        free_mb = usage.free // (1024 * 1024)
+        checks["disk_free_mb"] = free_mb
+        if free_mb < MIN_FREE_DISK_MB:
+            checks["disk"] = f"ponizej progu {MIN_FREE_DISK_MB} MB"
+            healthy = False
+        else:
+            checks["disk"] = "ok"
+    except OSError as exc:
+        checks["disk"] = f"{type(exc).__name__}: {exc}"
+        healthy = False
+
+    body = {"status": "ok" if healthy else "unhealthy", "checks": checks}
+    # 503, a nie 200 z polem "unhealthy": healthcheck w compose patrzy wylacznie
+    # na to, czy urlopen() rzucil - kod odpowiedzi jest jedynym sygnalem, ktory
+    # do dockera dociera. Cialo jest dla czlowieka.
+    return JSONResponse(body, status_code=200 if healthy else 503)
 
 
 # Serve static files (frontend).

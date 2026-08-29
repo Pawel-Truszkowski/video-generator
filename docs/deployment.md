@@ -19,12 +19,14 @@ decyzji nizej i nie sa one kosmetyczne.
 |---|---|
 | Port publiczny | `bob108.mikrus.xyz:30108` → `192.168.1.108:30108` |
 | IPv6 VPS-a | `2a01:4f9:3090:1dcc::108` |
+| Subdomena z HTTPS (panel Mikrusa → port 30108) | `https://ai-video-generator.cytr.us` |
 | Katalog na VPS (przyjety w tej instrukcji) | `/opt/video-generator` |
 
 Do zdobycia przed startem:
 
-1. **Subdomena z HTTPS** — panel Mikrusa, sekcja z domenami/subdomenami. Podpinasz
-   darmowa subdomene (np. `cos.wykr.es`) do portu **30108**. Mikrus terminuje TLS
+1. ~~**Subdomena z HTTPS**~~ — ZROBIONE. Panel Mikrusa, sekcja z domenami/subdomenami. Podpinasz
+   darmowa subdomene (Mikrus daje m.in. `*.cytr.us`, `*.wykr.es`, `*.bieda.it`)
+   do portu **30108**. Mikrus terminuje TLS
    i przekazuje ruch po http na twoj port. Nazwy zakladek w panelu bywaja
    zmieniane — szukaj opcji laczacej subdomene z portem TCP.
 2. **Klucz Resend** — [resend.com](https://resend.com), darmowy plan. Bez niego
@@ -37,6 +39,32 @@ Do zdobycia przed startem:
 > strażnik milczy — a `POST /auth/request-login` zwraca wtedy link logujacy
 > **w odpowiedzi HTTP dla dowolnego adresu e-mail**. Kazdy, kto zna URL, loguje
 > sie na dowolne konto. HTTPS wlacza ochrone, ktora na http nie istnieje.
+
+### Dlaczego NIE ma tu nginxa ani Caddy'ego
+
+Reverse proxy w tym wdrozeniu juz jest — stoi u Mikrusa, przed twoim VPS-em.
+To ono terminuje TLS dla `ai-video-generator.cytr.us` i przekazuje ruch po http
+na port 30108. Postawienie wlasnego nginxa dolozyloby **drugi** proxy za pierwszym.
+
+Klasyczne powody, dla ktorych stawia sie nginxa, tutaj nie wystepuja:
+
+| Rola nginxa | Kto ja pelni w tym wdrozeniu |
+|---|---|
+| Terminacja TLS / certyfikat | proxy Mikrusa (Let's Encrypt wymagalby portow 80/443, ktorych nie masz) |
+| Serwowanie statykow | `StaticFiles` w FastAPI — kilka plikow, ruch znikomy |
+| Load balancing | jeden kontener, nie ma czego balansowac |
+| Limit rozmiaru uploadu | walidacja w aplikacji (`max_upload_mb`) |
+
+Doszedlby za to koszt: kolejny proces na maszynie z 1 GB RAM i — powazniej —
+**nowa klasa bledow wokol SSE**. Nginx domyslnie ma `proxy_buffering on`, co
+zbiera odpowiedz w buforze przed oddaniem klientowi. Dla `/jobs/{id}/events`
+znaczy to, ze pasek postepu stanie w miejscu, choc generacja idzie. Naprawa
+wymaga `proxy_buffering off`, `proxy_read_timeout` liczonego w minutach i
+naglowka `X-Accel-Buffering: no`. Czyli nginx nie rozwiazuje tu zadnego problemu,
+za to tworzy jeden, ktorego dzis nie masz.
+
+**Kiedy wrocic do tego tematu:** wlasna domena zamiast subdomeny Mikrusa,
+druga aplikacja na tym samym VPS-ie, albo rate limiting przed uploadem.
 
 ---
 
@@ -190,7 +218,7 @@ curl -sI http://127.0.0.1:30108/ | head -1
 curl -sI http://bob108.mikrus.xyz:30108/ | head -1
 
 # 4. HTTPS przez subdomene (z twojego komputera)
-curl -sI https://TWOJA-SUBDOMENA.wykr.es/ | head -1
+curl -sI https://ai-video-generator.cytr.us/ | head -1
 ```
 
 Jesli 1–3 dzialaja, a 4 nie — problem jest w przypisaniu subdomeny do portu

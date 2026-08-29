@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.4.1] — 2026-08-29 — Przygotowanie do deployu na VPS (roadmap Faza 4)
+
+Cel: uruchomienie na Mikrusie 2.1 (1 vCPU, ~1 GB RAM, ~10 GB dysku) pod publicznym
+HTTPS. Maszyna jest znaczaco mniejsza niz zakladala Faza 4.1, wiec wiekszosc zmian
+to nie kosmetyka deployowa, tylko zejscie z zasobami.
+
+### Osobny compose produkcyjny
+- `docker-compose.prod.yml` — port `30108:8000` (Mikrus przekierowuje
+  `bob108.mikrus.xyz:30108` na `192.168.1.108:30108`)
+- **Bez bind-mounta `./app`.** Lokalnie kontener czyta kod z dysku hosta; na serwerze
+  znaczyloby to, ze niedokonczony `git pull` albo edycja w edytorze natychmiast trafia
+  do zywej aplikacji. Bez mounta jedyna droga zmiany kodu jest `--build`
+- `restart: unless-stopped` (powrot po reboocie i po OOM-killu), `mem_limit: 700m`
+  (pod LXC bywa ignorowany — `docker inspect` pokazuje wtedy `0`), logi `json-file`
+  ograniczone do 3 × 10 MB, zeby nie zjadly dysku dzielonego z plikami wideo
+- `--proxy-headers` w uvicornie — za proxy Mikrusa request przychodzi po http
+
+### Endpoint `/health`
+- Sprawdza dwie rzeczy, ktore moga byc zepsute przy zywym procesie uvicorna: baze
+  (`SELECT 1`) i wolne miejsce w `data_dir` (prog `MIN_FREE_DISK_MB = 500`)
+- Odpyt bazy ma **wlasny** timeout 3 s, krotszy niz `timeout: 10s` healthchecku —
+  SQLite w jednym procesie potrafi sie zablokowac pod obciazeniem ffmpeg, a
+  healthcheck ma wtedy dostac czytelne `db: timeout`, nie zostac urwany przez dockera
+- Zwraca **503**, nie 200 z polem `"unhealthy"`: healthcheck w compose patrzy tylko na
+  to, czy `urlopen()` rzucil. Cialo odpowiedzi niesie oba pomiary, zeby diagnoza nie
+  wymagala wchodzenia na serwer
+- Zarejestrowany **przed** mountem `StaticFiles` — `Mount("/")` przechwycilby `/health`
+  i zwrocil 404 statycznego pliku, bez zadnego bledu przy starcie
+- Docker sam nie restartuje kontenera `unhealthy` (robi to tylko swarm), wiec falszywy
+  alarm nie kladzie aplikacji — to obniza koszt sprawdzania wiecej niz mniej
+
+### `SEMAPHORE_LIMIT` z env
+- `settings.semaphore_limit` bylo zaszyte na 4. Na 1 vCPU to 4 rownolegle lancuchy
+  scen, czyli 4 procesy ffmpeg naraz — prosta droga do OOM. Produkcyjne `.env` ustawia 1
+
+### Odchudzony obraz
+- `langgraph` i `langgraph-checkpoint-sqlite` usuniete z `requirements.txt` — **nic ich
+  nie importowalo** (pipeline nigdy nie byl na LangGraph, mimo nazwy `app/graph/`).
+  Ciagnely za soba `langchain-core`, `orjson`, `msgpack`. `pip install` jest
+  najbardziej pamieciozernym momentem calego deployu i na 1 GB bez swapu potrafi
+  zostac ubity w polowie, wiec to czesc wdrozenia, a nie porzadki obok
+
+### Backup i dokumentacja
+- `scripts/backup-db.sh` — `sqlite3.backup()` zamiast `cp` (baza jest otwarta przez
+  dzialajacy kontener, zwykla kopia moze zlapac plik w polowie transakcji), rotacja
+  7 dni, do crona
+- `docs/deployment.md` — instrukcja krok po kroku, w tym plan B (`docker save | ssh
+  docker load`), gdy build nie miesci sie w pamieci VPS-a
+- `.env.prod.example` — szablon env na serwer
+
+### Znane ryzyko wdrozenia
+- **Czyszczenie plikow dalej nie istnieje** (Faza 1.3). 10 GB dysku dzielone z systemem
+  przy braku cleanupu to kwestia tygodni. `docs/deployment.md` §8 opisuje reczne
+  sprzatanie, `/health` ostrzega przed przekroczeniem progu
+- Brak systemu kredytow i limitu jobow na uzytkownika (Faza 3, 1.3): kazdy zalogowany
+  wydaje pieniadze wlasciciela instancji
+
 ## [0.4.0] — 2026-08-29 — Obsluga bledow i retry (roadmap Faza 1.2)
 
 Po 0.3.0 job przezywal restart kontenera, ale **jedna nieudana scena dalej kladla cala
