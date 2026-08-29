@@ -15,7 +15,12 @@ from sse_starlette.sse import EventSourceResponse
 from app.auth.deps import get_owned_job, require_user
 from app.config import settings
 from app.db import get_db
-from app.graph.pipeline import get_event_queue, run_generation, run_planning
+from app.graph.pipeline import (
+    get_event_queue,
+    release_event_queue,
+    run_generation,
+    run_planning,
+)
 from app.services import job_state
 
 # Every route here requires a session by construction, so a future route added to
@@ -32,6 +37,12 @@ THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 # Editing the plan rewrites the scenes table, and clips are named by scene
 # index — a reorder mid-generation would misattach an already rendered clip.
 BLOCKED_EDIT_STATUSES = ("generating", "stitching", "done")
+
+# Retrying one scene spends money, so this is an allowlist: a status added later
+# is refused until someone decides it should not be. 'planned'/'uploaded' have no
+# clips to retry (that is POST /generate), and 'done' would overwrite a finished
+# film — both go through their own endpoints instead.
+RETRYABLE_JOB_STATUSES = ("error", "interrupted")
 
 
 def _start(job_id: str, coro) -> None:
@@ -322,6 +333,56 @@ async def get_job_image(index: int, job: aiosqlite.Row = Depends(get_owned_job))
     )
 
 
+def _assert_scene_retryable(job: aiosqlite.Row, scene: dict) -> None:
+    """Refuse a retry that makes no sense, with a 409.
+
+    `job["status"]` is the job's state ('uploaded' / 'planned' / 'generating' /
+    'stitching' / 'interrupted' / 'error' / 'done'); `scene["status"]` is one of
+    'pending' / 'done' / 'error'.
+    """
+    if job["status"] not in RETRYABLE_JOB_STATUSES:
+        raise HTTPException(409, f"Nie można powtórzyć sceny w statusie joba: {job['status']}")
+    if scene.get("status") != "error":
+        raise HTTPException(409, f"Nie można powtórzyć sceny w statusie: {scene.get('status')}")
+
+
+@router.post("/jobs/{job_id}/scenes/{idx}/retry")
+async def retry_scene(job_id: str, idx: int, job: aiosqlite.Row = Depends(get_owned_job)):
+    """Regenerate one failed scene, then carry the job on to stitching.
+
+    No dedicated generation path: clearing this row makes already_rendered()
+    return False for this scene and True for every other, so the ordinary
+    run_generation refills exactly the one gap. A scene later in the same chain
+    needs no cascade either — process_chain is sequential, so anything after a
+    failure never ran and is still 'pending'.
+    """
+    state = await job_state.load_state(job_id)
+    if state is None or not state["scenes"]:
+        raise HTTPException(400, "Brak planu dla tego joba")
+    if idx < 0 or idx >= len(state["scenes"]):
+        raise HTTPException(400, "Invalid scene index")
+
+    # Checked before the reset, not by letting _start() raise: refusing after
+    # the wipe would leave the scene cleared with nothing running to refill it.
+    if job_id in _running:
+        raise HTTPException(409, "Ten job już się wykonuje")
+
+    _assert_scene_retryable(job, state["scenes"][idx])
+
+    await job_state.reset_scene(job_id, idx)
+    # The status reset alone would be enough for already_rendered(), but a
+    # half-written file from a cancelled attempt must not outlive it.
+    clip = job_state.clip_path_for(job_id, idx)
+    for path in (clip, f"{clip}.part"):
+        if os.path.exists(path):
+            os.remove(path)
+
+    state = await job_state.load_state(job_id)
+    _start(job_id, run_generation(job_id, state))
+
+    return {"status": "generating", "idx": idx}
+
+
 def _decide_stage(job: aiosqlite.Row, scenes: list[dict]) -> str:
     """Which pipeline stage a job should resume from.
 
@@ -379,12 +440,17 @@ async def job_events(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     queue = get_event_queue(job_id)
 
     async def event_generator():
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=30)
-                yield {"event": event["type"], "data": json.dumps(event)}
-            except asyncio.TimeoutError:
-                yield {"event": "ping", "data": "{}"}
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield {"event": event["type"], "data": json.dumps(event)}
+                except asyncio.TimeoutError:
+                    yield {"event": "ping", "data": "{}"}
+        finally:
+            # A disconnecting client cancels this generator, so `finally` is the
+            # only place guaranteed to run — code after the loop never would.
+            release_event_queue(job_id, queue)
 
     return EventSourceResponse(event_generator())
 

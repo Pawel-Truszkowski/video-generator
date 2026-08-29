@@ -14,6 +14,10 @@ SceneDone = Callable[[int, str], Awaitable[None]]
 SceneError = Callable[[int, str], Awaitable[None]]
 
 
+def _timeout_for(scene: dict) -> float:
+    return settings.clip_timeout_s
+
+
 def _get_provider():
     if settings.mock_provider:
         return MockProvider()
@@ -83,15 +87,23 @@ async def generate_clips(
             return out_path
 
         async with semaphore:
+            timeout = _timeout_for(scene)
             for attempt in range(settings.clip_max_retries + 1):
                 try:
-                    clip_path = await provider.generate_clip(
-                        image_path=input_image,
-                        prompt=scene["sub_prompt"],
-                        duration_s=scene["duration_s"],
-                        aspect_ratio=aspect_ratio,
-                        model=model,
-                        out_path=out_path,
+                    # Cancelling this cancels the await, not a thread already
+                    # running inside it: FalProvider downloads via
+                    # run_in_executor, so a timed-out download keeps going and
+                    # leaves an orphan {out_path}.part behind (Faza 1.3 sweeps it).
+                    clip_path = await asyncio.wait_for(
+                        provider.generate_clip(
+                            image_path=input_image,
+                            prompt=scene["sub_prompt"],
+                            duration_s=scene["duration_s"],
+                            aspect_ratio=aspect_ratio,
+                            model=model,
+                            out_path=out_path,
+                        ),
+                        timeout=timeout,
                     )
                     clip_paths[idx] = clip_path
                     # Keep the dict in step with the DB for any caller reusing it.
@@ -101,10 +113,17 @@ async def generate_clips(
                         await on_scene_done(idx, clip_path)
                     return clip_path
                 except Exception as e:
+                    # TimeoutError stringifies to '', so naming it is the only
+                    # way the message says anything at all.
+                    reason = (
+                        f"przekroczono limit {timeout:g}s"
+                        if isinstance(e, asyncio.TimeoutError)
+                        else f"{type(e).__name__}: {e}"
+                    )
                     if attempt == settings.clip_max_retries:
                         msg = (
-                            f"Scene {idx} failed after "
-                            f"{settings.clip_max_retries + 1} attempts: {e}"
+                            f"Scena {idx + 1} nie powiodła się po "
+                            f"{settings.clip_max_retries + 1} próbach: {reason}"
                         )
                         scene["status"] = "error"
                         if on_scene_error:
@@ -127,11 +146,23 @@ async def generate_clips(
 
             await generate_single(idx, input_image)
 
-    # Process chains in parallel, scenes within a chain sequentially
+    # Process chains in parallel, scenes within a chain sequentially.
     tasks = [process_chain(chain) for chain in chains]
-    await asyncio.gather(*tasks)
+    # return_exceptions: one failing chain must not cut short the others. Every
+    # clip that does render is one the user will not pay for again on retry.
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Scenes that raised. Note this is not the same as "not done": a scene after
+    # a failure in the same chain never ran at all and is still 'pending'.
+    failed = [i for i, s in enumerate(scenes) if s.get("status") == "error"]
+
+    if failed:
+        print(f"[job {job_id}] {len(failed)}/{len(scenes)} scen nieudanych: {failed}")
 
     return {
+        # Gaps are squeezed out, so this list only lines up with chain_flags when
+        # every scene rendered — run_generation checks that before stitching.
         "clip_paths": [p for p in clip_paths if p is not None],
-        "status": "stitching",
+        "status": "error" if failed else "stitching",
+        "failed_scenes": failed,
     }

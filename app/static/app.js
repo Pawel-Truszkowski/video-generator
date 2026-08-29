@@ -8,6 +8,10 @@
   // How many source images the job has, per the API: `files` is empty after a
   // resume, so the image picker has to count from the server instead.
   let imageCount = 0;
+  // Scenes as shown on the progress screen. Separate from currentScenes (the
+  // plan editor's working copy) because this one carries status/error and is
+  // refreshed by SSE rather than edited by the user.
+  let progressScenes = [];
 
   // Elements
   const dropzone = document.getElementById('dropzone');
@@ -32,6 +36,7 @@
   const progressBar = document.getElementById('progress-bar');
   const progressDetail = document.getElementById('progress-detail');
   const errorBox = document.getElementById('error-box');
+  const sceneProgress = document.getElementById('scene-progress');
   const videoResult = document.getElementById('video-result');
   const finalVideo = document.getElementById('final-video');
   const downloadLink = document.getElementById('download-link');
@@ -205,6 +210,18 @@
       updateProgressBar(data.status);
     });
 
+    eventSource.addEventListener('scene', e => {
+      const data = JSON.parse(e.data);
+      // The event carries no sub_prompt, so the existing one is kept: an event
+      // that beats the initial GET /jobs/{id} still renders, just untitled.
+      progressScenes[data.idx] = {
+        sub_prompt: progressScenes[data.idx]?.sub_prompt || '',
+        status: data.status,
+        error: data.error || null,
+      };
+      renderSceneProgress();
+    });
+    
     eventSource.addEventListener('done', e => {
       const data = JSON.parse(e.data);
       showDone(data.final_path);
@@ -421,14 +438,100 @@
     }
   });
 
-  function showProgressScreen(text) {
+  const SCENE_STATUS_LABELS = {
+    pending: 'Oczekuje', generating: 'Generowanie', done: 'Gotowe', error: 'Blad',
+  };
+
+  function renderSceneProgress() {
+    sceneProgress.innerHTML = '';
+
+    progressScenes.forEach((s, i) => {
+      const row = document.createElement('div');
+      row.className = 'scene-row';
+      row.dataset.idx = i;
+
+      const num = document.createElement('span');
+      num.className = 'scene-num';
+      num.textContent = `#${i + 1}`;
+
+      const text = document.createElement('span');
+      text.className = 'scene-text';
+      text.textContent = s.sub_prompt || '';
+
+      const badge = document.createElement('span');
+      badge.className = 'status-badge ' + (s.status || 'pending');
+      badge.textContent = SCENE_STATUS_LABELS[s.status] || s.status || '';
+
+      row.appendChild(num);
+      row.appendChild(text);
+
+      if (s.status === 'error') {
+        const err = document.createElement('span');
+        err.className = 'scene-err';
+        err.textContent = s.error || '';
+        err.title = s.error || '';
+        row.appendChild(err);
+
+        const retry = document.createElement('button');
+        retry.className = 'btn-link';
+        retry.textContent = 'Ponow';
+        retry.onclick = () => retryScene(i, retry);
+        row.appendChild(retry);
+      }
+
+      row.appendChild(badge);
+      sceneProgress.appendChild(row);
+    });
+  }
+
+  /** Pull the authoritative scene list from the server. */
+  async function loadSceneProgress() {
+    if (!jobId) return;
+    try {
+      const res = await apiFetch(`/jobs/${jobId}`);
+      if (!res.ok) return;
+      const detail = await res.json();
+      progressScenes = detail.scenes.map(sc => ({
+        sub_prompt: sc.sub_prompt,
+        status: sc.status,
+        error: sc.error,
+      }));
+      renderSceneProgress();
+    } catch (_) {}  // apiFetch already switched screens on 401
+  }
+
+  async function retryScene(idx, button) {
+    button.disabled = true;
+    button.textContent = 'Ponawianie...';
+    try {
+      const res = await apiFetch(`/jobs/${jobId}/scenes/${idx}/retry`, { method: 'POST' });
+      if (!res.ok) throw new Error(await errText(res));
+      errorBox.classList.add('hidden');
+      statusText.textContent = 'Generowanie klipow...';
+      statusText.className = 'status-badge generating';
+      // The server reset the row before starting, so mirror that locally
+      // instead of waiting for an event that only fires when it finishes.
+      progressScenes[idx].status = 'pending';
+      progressScenes[idx].error = null;
+      renderSceneProgress();
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') {
+        alert('Blad: ' + e.message);
+        button.disabled = false;
+        button.textContent = 'Ponow';
+      }
+    }
+  }
+
+  function showProgressScreen(text, badgeClass) {
     btnGenerate.disabled = true;
     showScreen('screen-progress');
     errorBox.classList.add('hidden');
     videoResult.classList.add('hidden');
     progressBar.style.width = '30%';
     statusText.textContent = text || 'Generowanie klipow...';
-    statusText.className = 'status-badge generating';
+    statusText.className = 'status-badge ' + (badgeClass || 'generating');
+    loadSceneProgress();
   }
 
   // Back
@@ -448,6 +551,9 @@
   }
 
   function showError(msg) {
+    // Scenes that never ran (the tail of a broken chain) emit no event of their
+    // own, so the list is re-read rather than patched from what arrived.
+    loadSceneProgress();
     errorBox.textContent = 'Blad: ' + msg;
     errorBox.classList.remove('hidden');
     statusText.textContent = 'Blad';
@@ -531,6 +637,35 @@
     const m = Math.floor(totalS / 60);
     const s = totalS % 60;
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  /** Open a job's progress screen read-only — no POST, nothing starts.
+
+    This is the only way back to a finished or failed job's scene list, and so
+    the only way to reach a single scene's "Ponow" after leaving the page:
+    resumeJob() regenerates every failed scene at once by design.
+   */
+  function previewJob(job) {
+    jobId = job.id;
+    files = [];
+
+    // Connected up front so a retry started from this screen streams live.
+    connectSSE();
+
+    showProgressScreen(STATUS_LABELS[job.status] || job.status, statusClass(job.status));
+    // showProgressScreen assumes work in flight; nothing is running here.
+    progressBar.style.width = job.status === 'done' ? '100%' : '0%';
+    progressDetail.textContent = '';
+
+    if (job.error) {
+      errorBox.textContent = 'Blad: ' + job.error;
+      errorBox.classList.remove('hidden');
+    }
+    if (job.video_url) {
+      videoResult.classList.remove('hidden');
+      finalVideo.src = job.video_url;
+      downloadLink.href = job.video_url;
+    }
   }
 
   /** Pick a job back up from wherever it stopped. */
@@ -641,6 +776,15 @@
 
     const actions = document.createElement('div');
     actions.className = 'job-actions';
+
+    // Any job with a plan has scenes worth looking at, whatever its status.
+    if (job.scene_count) {
+      const preview = document.createElement('button');
+      preview.className = 'btn-link';
+      preview.textContent = 'Podglad';
+      preview.onclick = () => previewJob(job);
+      actions.appendChild(preview);
+    }
 
     if (RESUMABLE_STATUSES.includes(job.status)) {
       const resume = document.createElement('button');

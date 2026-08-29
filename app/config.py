@@ -33,6 +33,9 @@ class Settings:
     semaphore_limit: int = 4
     clip_poll_interval: float = 5.0
     clip_max_retries: int = 2
+    # Ceiling for one provider call. Without it a provider that never answers
+    # parks the job forever: no error, no 'interrupted', no way out.
+    clip_timeout_s: float = field(default_factory=lambda: float(os.getenv("CLIP_TIMEOUT_S", "600")))
     crossfade_duration: float = 0.5
     output_width: int = 1280
     output_height: int = 720

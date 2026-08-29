@@ -10,30 +10,66 @@ from app.graph.nodes.generate_clips import generate_clips
 from app.graph.nodes.stitch import stitch
 from app.services import job_state
 
-# SSE event bus — job_id → asyncio.Queue
+# SSE event bus — job_id → one queue per connected subscriber.
 _event_queues: dict[str, list[asyncio.Queue]] = {}
+
+# Bounded so a subscriber that stopped reading cannot grow without limit. Sized
+# far above a normal job (a handful of events per scene): hitting it means a
+# client is gone, not that the job is busy.
+EVENT_QUEUE_MAXSIZE = 100
 
 
 def get_event_queue(job_id: str) -> asyncio.Queue:
-    q: asyncio.Queue = asyncio.Queue()
+    q: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_MAXSIZE)
     _event_queues.setdefault(job_id, []).append(q)
     return q
 
 
+def release_event_queue(job_id: str, q: asyncio.Queue) -> None:
+    """Unsubscribe one client. Must run when its SSE generator ends.
+
+    Drops the job_id key once the last subscriber leaves — otherwise the dict
+    grows one dead entry per job for the lifetime of the process.
+    """
+    queues = _event_queues.get(job_id)
+    if not queues:
+        return
+    try:
+        queues.remove(q)
+    except ValueError:
+        return
+    if not queues:
+        del _event_queues[job_id]
+
+
 def _emit(job_id: str, event: dict):
-    for q in _event_queues.get(job_id, []):
-        q.put_nowait(event)
+    # Iterate a copy: handling a full queue may unsubscribe it mid-loop.
+    for q in list(_event_queues.get(job_id, [])):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            # A full queue means this subscriber stopped draining it, so drop it:
+            # skipping the event would leave the queue full forever, and the
+            # browser's EventSource reconnects on its own.
+            print(f"[job {job_id}] SSE subscriber not reading — dropped")
+            release_event_queue(job_id, q)
 
 
 async def _update_job_status(job_id: str, status: str, error: str | None = None,
                               est_cost: float | None = None):
     db = await get_db()
+    # Every non-error transition clears `error`: a job that later succeeds must
+    # not keep the message from the run that failed, or the UI shows a finished
+    # film flagged as broken.
     if error:
         await db.execute("UPDATE jobs SET status=?, error=? WHERE id=?", (status, error, job_id))
     elif est_cost is not None:
-        await db.execute("UPDATE jobs SET status=?, est_cost_usd=? WHERE id=?", (status, est_cost, job_id))
+        await db.execute(
+            "UPDATE jobs SET status=?, est_cost_usd=?, error=NULL WHERE id=?",
+            (status, est_cost, job_id),
+        )
     else:
-        await db.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
+        await db.execute("UPDATE jobs SET status=?, error=NULL WHERE id=?", (status, job_id))
     await db.commit()
 
 
@@ -98,6 +134,16 @@ async def run_generation(job_id: str, state: dict) -> dict:
 
         result = await generate_clips(state, on_scene_done, on_scene_error)
         state.update(result)
+
+        # Only stitch a complete set. generate_clips returns clip_paths with the
+        # gaps squeezed out, so one missing scene would shift the list against
+        # chain_flags and stitch_clips would crossfade the wrong pairs.
+        missing = [i for i, s in enumerate(state["scenes"]) if s.get("status") != "done"]
+        if missing:
+            msg = f"Nie wygenerowano scen: {', '.join(str(i + 1) for i in missing)}"
+            await _update_job_status(job_id, "error", msg)
+            _emit(job_id, {"type": "error", "error": msg})
+            return {**state, "status": "error", "error": msg}
 
         _emit(job_id, {"type": "status", "status": "stitching"})
         await _update_job_status(job_id, "stitching")

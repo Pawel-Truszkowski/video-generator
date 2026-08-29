@@ -106,7 +106,8 @@ async def load_state(job_id: str) -> dict | None:
         return None
 
     cur = await db.execute(
-        "SELECT idx, image_index, sub_prompt, duration_s, chain_from_prev, status, clip_path "
+        "SELECT idx, image_index, sub_prompt, duration_s, chain_from_prev, status, "
+        "       clip_path, error "
         "  FROM scenes WHERE job_id = ? ORDER BY idx",
         (job_id,),
     )
@@ -118,6 +119,7 @@ async def load_state(job_id: str) -> dict | None:
             "chain_from_prev": bool(r["chain_from_prev"]),
             "status": r["status"],
             "clip_path": r["clip_path"],
+            "error": r["error"],
         }
         for r in await cur.fetchall()
     ]
@@ -194,24 +196,41 @@ async def set_job_cost(job_id: str, est_cost_usd: float) -> None:
     await db.commit()
 
 
+async def reset_scene(job_id: str, idx: int) -> None:
+    """Put one scene back to 'pending' so the next run regenerates just it.
+
+    Clearing `status` is what flips already_rendered() to False for this scene
+    while every other one still short-circuits.
+    """
+    db = await get_db()
+    await db.execute(
+        "UPDATE scenes SET status = 'pending', clip_path = NULL, error = NULL "
+        " WHERE job_id = ? AND idx = ?",
+        (job_id, idx),
+    )
+    await db.commit()
+
+
 async def mark_scene_done(job_id: str, idx: int, clip_path: str) -> None:
     """Persist one finished clip. This is what makes generation resumable."""
     db = await get_db()
     await db.execute(
-        "UPDATE scenes SET status = 'done', clip_path = ? WHERE job_id = ? AND idx = ?",
+        # error = NULL: a scene that succeeds on retry must not keep the message
+        # from the attempt that failed, or the UI would still flag it as broken.
+        "UPDATE scenes SET status = 'done', clip_path = ?, error = NULL "
+        " WHERE job_id = ? AND idx = ?",
         (clip_path, job_id, idx),
     )
     await db.commit()
 
 
 async def mark_scene_error(job_id: str, idx: int, error: str) -> None:
-    # `scenes` has no error column yet; the message goes to the log, where
-    # pipeline failures are already read from.
+    """Record why one scene failed, so the UI can offer a targeted retry."""
     print(f"[job {job_id}] scene {idx} failed: {error}")
     db = await get_db()
     await db.execute(
-        "UPDATE scenes SET status = 'error' WHERE job_id = ? AND idx = ?",
-        (job_id, idx),
+        "UPDATE scenes SET status = 'error', error = ? WHERE job_id = ? AND idx = ?",
+        (error, job_id, idx),
     )
     await db.commit()
 

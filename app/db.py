@@ -90,6 +90,11 @@ async def _migrate(db: aiosqlite.Connection) -> None:
 
     scene_cols = await _column_names(db, "scenes")
 
+    if "error" not in scene_cols:
+        # Why a column and not just the log: the UI offers a per-scene retry, so
+        # the reason a scene failed has to survive a restart and be readable per row.
+        await db.execute("ALTER TABLE scenes ADD COLUMN error TEXT")
+
     if "image_index" not in scene_cols:
         await db.execute(
             "ALTER TABLE scenes ADD COLUMN image_index INTEGER NOT NULL DEFAULT 0"
