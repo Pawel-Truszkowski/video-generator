@@ -316,6 +316,8 @@ docker compose -f docker-compose.prod.yml up -d
 
 Rebuild nie jest potrzebny — `MOCK_PROVIDER` to zmienna srodowiskowa, ale
 `Settings` czyta ja **raz, przy imporcie**, wiec kontener musi wstac na nowo.
+Uwaga: `docker compose restart` tu **nie wystarczy** — zmienne srodowiskowe sa
+przypisywane przy tworzeniu kontenera, wiec potrzebny jest `up -d`, ktory go podmieni.
 
 Pierwszy realny job zrob na 2 scenach po 5 s najtanszym modelem (`wan`, $0.05/s
 wg `model_costs`) — to okolo $0.50. Ekran planu pokazuje `est_cost_usd` przed
@@ -351,3 +353,72 @@ docker compose -f docker-compose.prod.yml restart app
 
 Job, ktory padl przez restart, ma status `interrupted` i przycisk **Wznow** —
 sceny juz wygenerowane nie beda generowane (ani placone) drugi raz.
+
+---
+
+## 11. Wysylka maili do dowolnych adresow (wlasna domena w Resend)
+
+Domyslny nadawca `onboarding@resend.dev` dostarcza **wylacznie na adres wlasciciela
+konta Resend**. To ograniczenie nadawcy, nie odbiorcy — aplikacja wysyla poprawnie,
+Resend po prostu odmawia doreczenia. Zeby zalogowac mogl sie ktokolwiek, trzeba
+nadawac z domeny, ktora sie kontroluje.
+
+**Subdomena od Mikrusa (`*.cytr.us`) sie nie nada** — weryfikacja polega na dopisaniu
+rekordow do DNS domeny, a `cytr.us` nalezy do Mikrusa.
+
+### Kroki
+
+1. **Kup domene** (~40-60 zl/rok). Cloudflare Registrar / Porkbun / OVH / nazwa.pl —
+   obojetne, byle byl dostep do edycji rekordow DNS.
+2. **Resend → Domains → Add Domain.** Warto podac **subdomene** do wysylki, np.
+   `mail.twoja-domena.pl`, a nie domene glowna: gdyby reputacja nadawcy kiedys
+   ucierpiala, nie pociagnie za soba twojej poczty firmowej.
+3. **Wklej wygenerowane rekordy do DNS.** Resend poda komplet:
+   - `TXT` z kluczem **DKIM** (`resend._domainkey...`) — podpis kryptograficzny maila
+   - `TXT` ze **SPF** (`v=spf1 include:amazonses.com ~all`) — kto moze wysylac w twoim imieniu
+   - `MX` — obsluga odbic (bounce)
+   - opcjonalnie `DMARC` — warto dodac, poprawia dostarczalnosc
+4. **Poczekaj i kliknij Verify.** Propagacja DNS to zwykle minuty, czasem godziny.
+   Dopoki Resend nie pokaze `Verified`, nie ruszaj dalej.
+5. **Na VPS, w `.env`:**
+   ```bash
+   MAIL_FROM=Video Generator <no-reply@mail.twoja-domena.pl>
+   ```
+   Adres **musi** byc w zweryfikowanej domenie. Inny → Resend odrzuca zadanie.
+6. **Odtworz kontener** — `up -d`, a **nie** `restart`:
+   ```bash
+   docker compose -f docker-compose.prod.yml up -d
+   ```
+   `docker compose restart` restartuje proces w **tym samym** kontenerze, a zmienne
+   srodowiskowe sa ustalane w chwili jego tworzenia — zobaczylby stary `MAIL_FROM`.
+   `up -d` wykrywa zmiane w `.env` i podmienia kontener na nowy.
+7. **Test z innego adresu niz wlasny.** To jedyny test, ktory cokolwiek dowodzi —
+   na swoj wlasny mail dochodzilo takze przed zmiana.
+
+### Co sprawdzic, gdy mail nie dochodzi
+
+Aplikacja zwraca wtedy `502 Nie udalo sie wyslac emaila`, a **prawdziwy powod jest
+w logach kontenera** (`api/auth.py` loguje `Mail send failed for ...`):
+
+```bash
+docker compose -f docker-compose.prod.yml logs --tail 50 app | grep -i "mail send failed"
+```
+
+| W logu | Przyczyna |
+|---|---|
+| `Resend error 403` | `MAIL_FROM` spoza zweryfikowanej domeny albo domena jeszcze nie `Verified` |
+| `Resend error 401` | zly `RESEND_API_KEY` |
+| `Resend error 422` | zly format `MAIL_FROM` (musi byc `Nazwa <adres@domena>` albo samo `adres@domena`) |
+| brak wpisu, uzytkownik nie widzi maila | mail poszedl — szukaj w spamie; jesli tam jest, dodaj rekord DMARC |
+
+Darmowy plan Resend to **100 maili na dobe** i 3000 miesiecznie. Kazde kliniecie
+"zaloguj" to jeden mail, a limit `login_rate_per_email` (3 na 15 min) tego nie
+zastapi — pilnuje jednego adresu, nie calej puli.
+
+### Zanim otworzysz logowanie szerzej
+
+Nie ma systemu kredytow (Faza 3) ani limitu jobow na uzytkownika (Faza 1.3).
+Przy `MOCK_PROVIDER=false` **kazdy zalogowany generuje filmy za twoje pieniadze**,
+bez gornej granicy. Dopoki tego nie ma, otwarte logowanie ma sens tylko z
+`MOCK_PROVIDER=true` — wtedy kosztuje wylacznie miejsce na dysku, ktorego rowniez
+nikt nie sprzata (sekcja 8).
