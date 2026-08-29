@@ -1,0 +1,52 @@
+# Produkcja (Mikrus 2.1). Uruchamianie:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Rozni sie od docker-compose.yml trzema rzeczami, ktore na VPS sa istotne:
+#   * brak bind-mounta ./app  - kontener wstaje z kodu wpieczonego w obraz,
+#     wiec `git pull` bez `--build` niczego nie zmienia (i nie da sie przypadkiem
+#     wystawic swiata na niedokonczona edycje pliku na dysku serwera)
+#   * restart + healthcheck   - kontener wraca po reboocie VPS-a i po OOM-killu
+#   * limit logow             - json-file bez max-size rosnie w nieskonczonosc,
+#     a na 10 GB dysku dzielonym z plikami wideo to realny sposob na zapchanie
+services:
+  app:
+    build: .
+    # Lewa strona = port na VPS-ie (192.168.1.108:30108), przekierowany przez
+    # Mikrusa na bob108.mikrus.xyz:30108. Prawa = port w kontenerze.
+    ports:
+      - "30108:8000"
+      # Dostep bezposrednio po publicznym IPv6 VPS-a
+      # (http://[2a01:4f9:3090:1dcc::108]:30108). Docker publikuje domyslnie
+      # tylko na IPv4, wiec bez tej linii IPv6 nie odpowie. Odkomentuj tylko
+      # jesli naprawde tego potrzebujesz - to omija HTTPS-owe proxy Mikrusa.
+      # - "[::]:30108:8000"
+    env_file: .env
+    volumes:
+      # Jedyny stan, ktory przezywa `docker compose down`: baza + uploady +
+      # klipy + gotowe filmy. Nigdy nie kasuj tego katalogu przy deployu.
+      - ./data:/data
+    restart: unless-stopped
+    # --proxy-headers: za proxy Mikrusa request przychodzi po http, wiec bez
+    # tego request.url widzi "http" i logi klamia o schemacie. Magic linki i tak
+    # buduje BASE_URL, nie Host z requestu (app/api/auth.py:74).
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips=*
+    # Obraz nie ma curl-a (python:3.12-slim), wiec pytamy Pythonem.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    # Mikrus 2.1 ma ~1 GB RAM. Bez limitu ffmpeg przy stitchu potrafi pociagnac
+    # cala maszyne i OOM-killer ubije sshd zamiast kontenera.
+    # UWAGA: pod LXC docker moze zgłosic "no support for memory limit" i zignorowac
+    # ten wpis - patrz docs/deployment.md, sekcja "Limity pamieci".
+    mem_limit: 700m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

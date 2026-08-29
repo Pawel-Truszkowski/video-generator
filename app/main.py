@@ -50,6 +50,21 @@ app = FastAPI(title="Video Generator POC", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(jobs_router)
 
+
+@app.get("/health")
+async def health():
+    """Healthcheck dla dockera i monitoringu (docker-compose.prod.yml, co 60 s).
+
+    Musi byc zarejestrowany PRZED mountem StaticFiles ponizej, inaczej
+    Mount("/") przechwyci /health i zwroci 404 statycznego pliku.
+
+    Uwaga na kontrakt: docker sam z siebie NIE restartuje kontenera oznaczonego
+    jako unhealthy (robi to tylko swarm) - `docker compose ps` po prostu pokaze
+    stan. Wiec falszywy alarm nie kladzie aplikacji.
+    """
+    # TODO(human)
+
+
 # Serve static files (frontend).
 # Keep this LAST — Mount("/") matches every path, so any router included below
 # it is silently unreachable (its routes would return static-file 404s).

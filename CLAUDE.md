@@ -13,6 +13,8 @@ cp .env.example .env            # fill in FAL_KEY / OPENAI_API_KEY / ANTHROPIC_A
 docker compose up --build       # serves on http://localhost:8000, live-reloads (./app is bind-mounted)
 ```
 
+Production runs from a **second compose file**, `docker-compose.prod.yml` (`docker compose -f docker-compose.prod.yml up -d --build`): no `./app` bind-mount, so a `git pull` without `--build` changes nothing; plus `restart: unless-stopped`, a `/health` healthcheck, capped json-file logs and `mem_limit`. Deployment target and its constraints are in `docs/deployment.md`; `.env.prod.example` is the server-side env template.
+
 Note the container does **not** hot-reload Python (uvicorn runs without `--reload`) — `./app` is bind-mounted, but you must `docker compose restart app` for backend changes. Static files under `app/static/` *are* served live; hard-reload the browser to bust its cache.
 
 There is no local (non-Docker) run path documented and no test suite — `app.js`/pytest/etc. are not present. Validate changes by running the container and exercising the API/UI directly (see "Manual verification" below).
@@ -39,7 +41,7 @@ Schema changes to existing tables go in `_migrate()` in `app/db.py`, not in the 
 
 ## Architecture
 
-**Despite `langgraph`/`langgraph-checkpoint-sqlite` being in `requirements.txt`, the pipeline is NOT built on LangGraph** — `app/graph/pipeline.py` just calls the four node functions directly as plain async functions with manual state-dict merging and SSE event emission. There's no graph and no checkpointing; resume exists but is hand-rolled against SQLite (see "Job state" below), not LangGraph's `interrupt()`. Don't assume LangGraph APIs are in play when reading `app/graph/`.
+**The pipeline is NOT built on LangGraph** despite the `app/graph/` directory name (`langgraph`/`langgraph-checkpoint-sqlite` were dropped from `requirements.txt` in 0.4.1 — nothing imported them, and the install footprint mattered on a 1 GB VPS) — `app/graph/pipeline.py` just calls the four node functions directly as plain async functions with manual state-dict merging and SSE event emission. There's no graph and no checkpointing; resume exists but is hand-rolled against SQLite (see "Job state" below), not LangGraph's `interrupt()`. Don't assume LangGraph APIs are in play when reading `app/graph/`.
 
 Request flow:
 

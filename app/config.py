@@ -30,7 +30,10 @@ class Settings:
 
     max_upload_mb: int = 10
     max_images: int = 30
-    semaphore_limit: int = 4
+    # Ile lancuchow scen leci rownolegle. Env-driven, bo to jedyny parametr,
+    # ktory trzeba zejsc na maszynie o 1 vCPU / 1 GB RAM: kazdy rownolegly
+    # lancuch to wlasny proces ffmpeg przy normalizacji klipu.
+    semaphore_limit: int = field(default_factory=lambda: int(os.getenv("SEMAPHORE_LIMIT", "4")))
     clip_poll_interval: float = 5.0
     clip_max_retries: int = 2
     # Ceiling for one provider call. Without it a provider that never answers
