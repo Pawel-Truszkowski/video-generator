@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
-import uuid
 
 from app.config import settings
+
+
+def _escape_drawtext(text: str) -> str:
+    """Make `text` safe to drop inside drawtext=text='...' in a filtergraph.
+
+    FFmpeg unescapes a filtergraph in two passes and the quotes only survive the
+    first, so a bare `:` still reaches the option parser and ends the drawtext
+    argument early. Quoting alone and backslashes alone both fail; only the two
+    together work (checked on ffmpeg 7.1).
+
+    Apostrophes are dropped rather than escaped — closing the quote, emitting an
+    escaped one and reopening is more machinery than a mock caption deserves.
+    """
+    return (
+        text.replace("\\", "\\\\")   # first, so later backslashes are not doubled again
+            .replace("'", "")
+            .replace(":", "\\:")
+            .replace("%", "\\%")   # drawtext expands %{...} sequences
+    )
 
 
 class MockProvider:
@@ -18,13 +35,10 @@ class MockProvider:
         duration_s: int,
         aspect_ratio: str,
         model: str,
+        out_path: str,
     ) -> str:
-        out_dir = os.path.join(settings.data_dir, "clips")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{uuid.uuid4().hex}.mp4")
-
         # Use the input image as background, overlay with prompt text
-        short_prompt = prompt[:60].replace("'", "")
+        short_prompt = _escape_drawtext(prompt[:60])
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1", "-i", image_path,

@@ -33,6 +33,9 @@ class Settings:
     semaphore_limit: int = 4
     clip_poll_interval: float = 5.0
     clip_max_retries: int = 2
+    # Ceiling for one provider call. Without it a provider that never answers
+    # parks the job forever: no error, no 'interrupted', no way out.
+    clip_timeout_s: float = field(default_factory=lambda: float(os.getenv("CLIP_TIMEOUT_S", "600")))
     crossfade_duration: float = 0.5
     output_width: int = 1280
     output_height: int = 720
@@ -46,9 +49,38 @@ class Settings:
     })
 
     model_endpoints: dict[str, str] = field(default_factory=lambda: {
-        "wan": "fal-ai/wan/image-to-video",
+        "wan": "fal-ai/wan-25-preview/image-to-video",
         "kling-2.5-turbo": "fal-ai/kling-video/v2.5-turbo/pro/image-to-video",
         "veo-3.1-fast": "fal-ai/veo3.1/fast/image-to-video",
+    })
+
+    # Per-model request schema. Every fal.ai endpoint takes `image_url` and
+    # `prompt`, and nothing else is shared: sending a field the endpoint does
+    # not declare is a 422, so each model has to be described rather than
+    # assumed. Values below mirror the published OpenAPI schema of each
+    # endpoint -- re-check them when bumping an endpoint slug.
+    #
+    #   durations       (seconds, api_value) pairs the endpoint accepts, sorted
+    #                   ascending. Scene durations are planned as 5 or 10s, so a
+    #                   model on a different grid needs mapping, not passthrough.
+    #   aspect_ratio    whether the endpoint declares an `aspect_ratio` field.
+    #   extra           constant arguments always sent for this model.
+    model_params: dict[str, dict] = field(default_factory=lambda: {
+        "wan": {
+            "durations": [(5, "5"), (10, "10")],
+            "aspect_ratio": False,
+            "extra": {"resolution": "720p"},
+        },
+        "kling-2.5-turbo": {
+            "durations": [(5, "5"), (10, "10")],
+            "aspect_ratio": False,
+            "extra": {},
+        },
+        "veo-3.1-fast": {
+            "durations": [(4, "4s"), (6, "6s"), (8, "8s")],
+            "aspect_ratio": True,
+            "extra": {"resolution": "720p"},
+        },
     })
 
 

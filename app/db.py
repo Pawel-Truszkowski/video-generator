@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS magic_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_magic_tokens_user ON magic_tokens(user_id);
+
+-- Every read of a job's plan is "all scenes of one job, in order" (load_state,
+-- GET /jobs/{id}). Not UNIQUE: an existing DB could already hold duplicate
+-- (job_id, idx) pairs and creating the index would then fail at startup.
+CREATE INDEX IF NOT EXISTS idx_scenes_job_idx ON scenes(job_id, idx);
 """
 
 # Indexes that reference columns added by _migrate(). These MUST run after the
@@ -82,6 +87,36 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             "UPDATE jobs SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             "WHERE created_at IS NULL"
         )
+
+    scene_cols = await _column_names(db, "scenes")
+
+    if "error" not in scene_cols:
+        # Why a column and not just the log: the UI offers a per-scene retry, so
+        # the reason a scene failed has to survive a restart and be readable per row.
+        await db.execute("ALTER TABLE scenes ADD COLUMN error TEXT")
+
+    if "image_index" not in scene_cols:
+        await db.execute(
+            "ALTER TABLE scenes ADD COLUMN image_index INTEGER NOT NULL DEFAULT 0"
+        )
+
+        # Backfill from the legacy 'image_<N>' label. The startswith() is what
+        # makes this exact: in SQL '_' is a single-character wildcard, so
+        # LIKE 'image_%' also matches e.g. 'images/foo.jpg'.
+        legacy = await db.execute(
+            "SELECT id, image_path FROM scenes WHERE image_path LIKE 'image_%'"
+        )
+        for row in await legacy.fetchall():
+            image_path = row["image_path"]
+            if image_path is not None and image_path.startswith("image_"):
+                try:
+                    idx = int(image_path.split("_")[1])
+                    await db.execute(
+                        "UPDATE scenes SET image_index = ? WHERE id = ?", (idx, row["id"])
+                    )
+                except ValueError:
+                    # Should never happen, but don't crash the whole migration if it does.
+                    pass
 
     await db.commit()
 

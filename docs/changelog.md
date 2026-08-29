@@ -1,5 +1,135 @@
 # Changelog
 
+## [0.4.0] — 2026-08-29 — Obsluga bledow i retry (roadmap Faza 1.2)
+
+Po 0.3.0 job przezywal restart kontenera, ale **jedna nieudana scena dalej kladla cala
+robote**: `asyncio.gather` bez `return_exceptions` przerywal oczekiwanie na pierwszym
+wyjatku, tresc bledu szla tylko do loga (tabela `scenes` nie miala na nia kolumny),
+a braku timeoutu nie ratowalo nic — scena, na ktora fal.ai nigdy nie odpowie, wieszala
+joba na zawsze. Teraz nieudana scena to nieudana scena, a nie koniec filmu.
+
+### Wyciek kolejek SSE (najpierw, bo retry by go zwielokrotnil)
+- `get_event_queue()` dopisywalo kolejke do `_event_queues[job_id]` przy kazdym
+  polaczeniu i **nigdy jej nie usuwalo**. `EventSource` wznawia polaczenie sam, wiec
+  kazde odswiezenie karty dokladalo komplet nowych kolejek, a `_emit()` karmilo je dalej
+- `release_event_queue()` wolane w `finally` generatora w `job_events` — rozlaczenie
+  klienta anuluje generator, wiec `finally` jest jedynym miejscem, ktore na pewno zadziala.
+  Klucz `job_id` znika po ostatnim subskrybencie
+- Kolejka ma `maxsize=100`; przepelnienie znaczy "klient przestal czytac", wiec `_emit()`
+  ja wyrejestrowuje zamiast pomijac zdarzenie. Pominiecie zostawiloby kolejke pelna na
+  zawsze, a EventSource i tak polaczy sie ponownie
+
+### Blad zapisany przy scenie
+- Nowa kolumna `scenes.error` (migracja w `_migrate()`); `mark_scene_error` zapisuje do
+  niej komunikat, `load_state` go czyta, a `mark_scene_done` czysci (`error = NULL`) —
+  scena udana przy ponowieniu nie moze zostac z komunikatem z nieudanej proby
+- To samo pietro wyzej: kazde przejscie `_update_job_status` na status inny niz `error`
+  czysci `jobs.error`. Bez tego ukonczony film pokazywal w UI blad z poprzedniego biegu
+
+### Czesciowa porazka zamiast calkowitej
+- `asyncio.gather(..., return_exceptions=True)` — lancuchy dobiegaja do konca niezaleznie
+  od siebie. Kazdy klip, ktory sie wygeneruje, to klip, za ktory nie placi sie drugi raz
+- `generate_clips` nie orzeka juz o losie joba: zwraca `status`, `failed_scenes`
+  i loguje `N/M scen nieudanych`. Decyzje podejmuje `run_generation`
+- **`run_generation` sklada film tylko przy komplecie scen.** To nie kosmetyka:
+  `clip_paths` wraca z wyciszonymi dziurami (`[p for p in clip_paths if p is not None]`),
+  wiec jedna brakujaca scena przesunelaby liste wzgledem `chain_flags` i `stitch_clips`
+  zrobilby przejscia miedzy zlymi parami. Do 0.3.0 ratowal nas tylko wyjatek
+
+### Timeout
+- `CLIP_TIMEOUT_S` (domyslnie 600) i `asyncio.wait_for` wokol wywolania providera,
+  **wewnatrz** petli retry — timeout zachowuje sie jak kazda inna nieudana proba
+- Plaski, nie skalowany do `duration_s`: wiekszosc czekania to kolejka po slot GPU
+  u dostawcy, ktorej dlugosc klipu nie obchodzi. Za ciasny timeout to najdrozszy blad —
+  dostawca liczy za rozpoczeta generacje niezaleznie od tego, czy odbierzemy plik
+- `str(asyncio.TimeoutError())` to pusty string, wiec komunikat nazywa timeout wprost
+  ("przekroczono limit 600s") zamiast urywac sie po dwukropku
+- Znane ograniczenie: `FalProvider` pobiera plik przez `run_in_executor`, a anulowanie
+  `wait_for` nie zabija watku w puli — pobieranie dokonczy sie i zostawi osierocony
+  `{out_path}.part` (sprzata Faza 1.3)
+
+### Ponowienie pojedynczej sceny
+- `POST /jobs/{id}/scenes/{idx}/retry` — czysci wiersz sceny i jej plik, po czym
+  uruchamia **zwykle** `run_generation`. Zadnej osobnej sciezki generacji: `already_rendered`
+  z 0.3.0 pomija wszystkie pozostale sceny, wiec uzupelniana jest dokladnie jedna dziura
+- Scena w srodku lancucha nie wymaga kaskadowego czyszczenia — `process_chain` jest
+  sekwencyjny, wiec sceny po nieudanej nigdy sie nie wygenerowaly i sa `pending`
+- Bramka jest **allowlista** (`RETRYABLE_JOB_STATUSES = ("error", "interrupted")`):
+  endpoint wydaje pieniadze, wiec status dodany w przyszlosci jest odrzucany, dopoki
+  ktos swiadomie go nie dopusci. Scena musi byc w `error`
+- Guard `_running` sprawdzany **przed** wyczyszczeniem sceny; odmowa po wyczyszczeniu
+  zostawilaby scene skasowana i nic biegnacego, co by ja odtworzylo
+
+### UI
+- Lista scen na ekranie postepu: numer, prompt, badge statusu, komunikat bledu i przycisk
+  **"Ponow"** przy scenach, ktore padly. Zdarzenie SSE `scene` (emitowane od 0.3.0
+  i do tej pory przez nikogo nie sluchane) aktualizuje wiersze na biezaco
+- Przycisk **"Podglad"** na karcie w "Moje filmy" — otwiera ekran postepu **bez
+  uruchamiania czegokolwiek**. Bez niego "Ponow" byl osiagalny wylacznie wtedy, gdy
+  uzytkownik siedzial na ekranie w chwili awarii: "Wznow" natychmiast regeneruje
+  wszystkie nieudane sceny naraz
+- `showError()` przeladowuje liste z serwera — sceny z ogona zerwanego lancucha nigdy
+  nie ruszyly, wiec nie emituja wlasnego zdarzenia i zostalyby na "Oczekuje"
+
+### Znane braki (opisane w roadmapie 1.2)
+- Wiersz sceny skacze z "Oczekuje" na "Gotowe" — nie ma zdarzenia na START sceny
+- Dlugi `sub_prompt` jest obcinany w wierszu (`white-space: nowrap`)
+
+## [0.3.0] — 2026-08-26 — Persystencja i wznawianie jobow (roadmap Faza 1.1)
+
+Stan jobu w locie zyl w module-level diccie `_job_states`. Restart kontenera kasowal go
+w calosci: job zostawal w bazie w statusie `generating` na zawsze, `POST /generate`
+odpowiadal `400 "Job state not found"`, a uzytkownik zaczynal od zera — **placac fal.ai
+drugi raz za klipy, ktore juz lezaly na dysku**. Teraz baza jest jedynym zrodlem prawdy.
+
+### Baza jako zrodlo prawdy
+- Nowa kolumna `scenes.image_index` (migracja w `_migrate()` + backfill ze starego
+  `image_path = "image_3"`), indeks `idx_scenes_job_idx ON scenes(job_id, idx)`
+- Nowy modul `app/services/job_state.py` — jedyna granica DB ⇄ dict stanu pipeline'u.
+  Wezly (`validate`/`plan_scenes`/`generate_clips`/`stitch`) nie zmienily sygnatur
+- `image_paths` odtwarzane z `data/uploads/{job_id}/`, nie z kolumny — system plikow
+  i tak jest autorytetem, a kopia w bazie moglaby sie rozjechac po czyszczeniu (Faza 1.3)
+- `generate_clips` zapisuje kazda ukonczona scene **od razu** (callbacki `on_scene_done`
+  / `on_scene_error`), a nie po calym wezle — crash na scenie 5 zostawia sceny 0-4 zapisane
+- Przy okazji per-scenowy postep w SSE (zdarzenie `scene` z `done`/`total`)
+
+### Deterministyczne sciezki klipow
+- `VideoProvider.generate_clip` dostal argument `out_path` — providery nie losuja juz
+  wlasnych nazw `uuid4().hex`, przez ktore po restarcie nie dalo sie powiazac pliku ze scena
+- Konwencja: `data/clips/{job_id}/scene_{idx:03d}.mp4`. Retry nadpisuje w miejscu,
+  Faza 1.3 skasuje jeden katalog na joba
+- `FalProvider` pobiera film na `{out_path}.part` i robi `os.replace()` — istnienie
+  `out_path` oznacza "scena gotowa", wiec polowicznie pobrany plik nie moze tam trafic
+
+### Wznawianie
+- `reconcile_interrupted()` w `lifespan`: statusy `planning`/`generating`/`stitching`
+  to po restarcie z definicji trup → nowy status `interrupted`
+- `POST /jobs/{id}/resume` — zwraca `stage` (`planning`/`planned`/`generating`/`done`).
+  Job w statusie `planned` **nigdy** nie startuje generacji sam: to klikniecie "Generuj"
+  wydaje pieniadze. Blad w pojedynczej scenie wznawia sie jako `generating`, nie
+  `planning` — przeplanowanie skasowaloby wiersze `scenes` razem z gotowymi klipami
+- `already_rendered()` pomija scene, ktora ma `status='done'`, plik pod `out_path`
+  i niezerowy rozmiar. Baza mowi "done", a pliku nie ma → regeneracja (dysk ma ostatnie slowo)
+- Guard `_running: set[str]` przeciw podwojnemu startowi. Utrata przy restarcie jest tu
+  poprawna: po restarcie faktycznie nic nie biegnie
+- Edycja planu odrzucana (409), gdy job jest w `generating`/`stitching`/`done` **albo**
+  gdy ktorakolwiek scena ma `status='done'` — `save_scenes` robi DELETE+INSERT i skasowalaby
+  `clip_path` oplaconych klipow
+
+### UI
+- Status `interrupted` ("Przerwane", bursztynowy badge) + przycisk "Wznow" na karcie
+  w "Moje filmy"
+- Edytor planu odtwarza sie po restarcie: miniatury z `GET /jobs/{id}/images/{index}`,
+  lista w selectcie "Zdjecie" z `image_count` w `GET /jobs/{id}` (przegladarka nie ma
+  juz obiektow `File`)
+
+### Inne
+- `PYTHONUNBUFFERED=1` w `docker-compose.yml` — bez tego `print()` z pipeline'u siedzial
+  w buforze i nigdy nie trafial do `docker compose logs`
+- `MockProvider` przestal sie wywalac na promptach z `:` / `%` / `'` — `_escape_drawtext()`.
+  FFmpeg rozpakowuje filtergraph dwuprzebiegowo, wiec apostrofy same nie chronia dwukropka
+  (ani backslash sam); potrzebne sa oba naraz
+
 ## [0.2.0] — 2026-08-01 — Logowanie i konta uzytkownikow (roadmap Faza 2.1 + 2.2)
 
 Do tej pory kazdy kto znal 12-znakowy `job_id` mogl czytac cudze prompty, edytowac

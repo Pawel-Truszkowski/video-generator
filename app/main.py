@@ -10,6 +10,7 @@ from app.db import get_db, close_db
 from app.api.auth import router as auth_router
 from app.api.jobs import router as jobs_router
 from app.config import settings
+from app.services.job_state import reconcile_interrupted
 
 
 def _check_config() -> None:
@@ -35,6 +36,11 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.data_dir, exist_ok=True)
     _check_config()
     await get_db()
+    # planning/generating/stitching belonged to the process that just died;
+    # nothing will push those jobs forward, so flag them as resumable.
+    stale = await reconcile_interrupted()
+    if stale:
+        print(f"[startup] {stale} przerwanych jobów oznaczonych jako 'interrupted'")
     yield
     await close_db()
 

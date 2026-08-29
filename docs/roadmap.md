@@ -10,17 +10,30 @@ Cel: MVP ktore mozna pokazac klientom i pobierac oplate.
 Priorytet: KRYTYCZNY
 Zaleznosci: brak
 
-### 1.1 Persystencja stanu jobow
-- [ ] Przeniesc `_job_states` (in-memory dict) do SQLite
-- [ ] Zapisywac `scenes`, `clip_paths`, `chain_flags`, `image_paths` w DB
-- [ ] Po restarcie kontenera — mozliwosc wznowienia joba od ostatniego ukonzczonego kroku
-- [ ] Nie generowac ponownie klipow ktore juz istnieja na dysku
+### 1.1 Persystencja stanu jobow — ZROBIONE (0.3.0)
+- [x] Przeniesc `_job_states` (in-memory dict) do SQLite
+- [x] Zapisywac `scenes`, `clip_paths`, `chain_flags`, `image_paths` w DB
+      (`image_paths` odtwarzane z dysku, `clip_paths` = kolumna `scenes.clip_path`)
+- [x] Po restarcie kontenera — mozliwosc wznowienia joba od ostatniego ukonzczonego kroku
+- [x] Nie generowac ponownie klipow ktore juz istnieja na dysku
 
 ### 1.2 Obsluga bledow i retry
-- [ ] Endpoint `POST /jobs/{id}/scenes/{idx}/retry` — ponowna generacja pojedynczej sceny
-- [ ] Przycisk "Ponow" w UI przy scenie ze statusem error
-- [ ] Timeout na generacje klipu (np. 10 min) — jesli fal.ai nie odpowie, oznacz scene jako error
-- [ ] Globalny retry joba — przycisk "Wznow" jesli job upadl
+- [x] Endpoint `POST /jobs/{id}/scenes/{idx}/retry` — ponowna generacja pojedynczej sceny
+- [x] Przycisk "Ponow" w UI przy scenie ze statusem error
+      (+ przycisk "Podglad" na karcie w "Moje filmy" — bez niego przycisk "Ponow" byl
+      osiagalny tylko wtedy, gdy uzytkownik siedzial na ekranie postepu w chwili awarii)
+- [x] Timeout na generacje klipu (`CLIP_TIMEOUT_S`, domyslnie 600 s)
+- [x] Globalny retry joba — przycisk "Wznow" jesli job upadl (dowiezione juz w 1.1)
+- [ ] Scena nie pokazuje stanu posredniego: lista skacze z "Oczekuje" na "Gotowe", bo
+      `generate_single` emituje tylko `on_scene_done`/`on_scene_error`. Brakuje trzeciego
+      callbacku na START sceny + zapisu `scenes.status='generating'`, zeby podglad po
+      odswiezeniu tez to pokazywal. Badge `generating` jest juz gotowy w UI.
+- [ ] Dlugi `sub_prompt` jest obcinany w wierszu sceny (`.scene-row .scene-text` ma
+      `white-space: nowrap` + `text-overflow: ellipsis` w `style.css`). Do wyboru:
+      zawijanie, atrybut `title` jak przy komunikacie bledu, albo rozwijanie po kliknieciu.
+- [x] Wyciek kolejek SSE — `release_event_queue()` wolane w `finally` generatora
+      w `job_events`, klucz `job_id` znika po ostatnim subskrybencie, kolejka ma
+      `maxsize=100`, a `_emit()` wyrejestrowuje kolejke, ktorej nikt nie opróznia.
 
 ### 1.3 Czyszczenie danych
 - [ ] Task/cron kasujacy pliki (clips, uploads, frames) starsze niz 7 dni
@@ -124,7 +137,8 @@ Zaleznosci: Faza 1-3
 ### 5.2 Polepszenie UI
 - [ ] Drag & drop zmiany kolejnosci scen
 - [ ] Podglad klipu po wygenerowaniu (przed stitchem)
-- [ ] Pasek postepu per scena (SSE z info ktora scena sie generuje)
+- [ ] Pasek postepu per scena — czesciowo w 1.2 (lista scen + zdarzenie SSE `scene`);
+      zostaje sam pasek, ktory dalej stoi na sztywnych 50% przez cala generacje
 - [ ] Responsywnosc na mobile
 - [ ] Polskie znaki w UI (obecnie ASCII)
 

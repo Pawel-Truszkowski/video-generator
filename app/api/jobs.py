@@ -15,17 +15,65 @@ from sse_starlette.sse import EventSourceResponse
 from app.auth.deps import get_owned_job, require_user
 from app.config import settings
 from app.db import get_db
-from app.graph.pipeline import get_event_queue, run_generation, run_planning
+from app.graph.pipeline import (
+    get_event_queue,
+    release_event_queue,
+    run_generation,
+    run_planning,
+)
+from app.services import job_state
 
 # Every route here requires a session by construction, so a future route added to
 # this router cannot accidentally be left public. Ownership of a specific job is
 # a separate check — see Depends(get_owned_job).
 router = APIRouter(dependencies=[Depends(require_user)])
 
-# In-memory state cache for running jobs
-_job_states: dict[str, dict] = {}
+# Ids of jobs with a live asyncio task. Losing this on restart is correct
+# rather than a bug: after a restart nothing is running.
+_running: set[str] = set()
 
 THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+# Editing the plan rewrites the scenes table, and clips are named by scene
+# index — a reorder mid-generation would misattach an already rendered clip.
+BLOCKED_EDIT_STATUSES = ("generating", "stitching", "done")
+
+# Retrying one scene spends money, so this is an allowlist: a status added later
+# is refused until someone decides it should not be. 'planned'/'uploaded' have no
+# clips to retry (that is POST /generate), and 'done' would overwrite a finished
+# film — both go through their own endpoints instead.
+RETRYABLE_JOB_STATUSES = ("error", "interrupted")
+
+
+def _start(job_id: str, coro) -> None:
+    """Run a pipeline coroutine in the background, once per job.
+
+    Closes the rejected coroutine: an un-awaited one leaks and warns at GC time.
+    """
+    if job_id in _running:
+        coro.close()
+        raise HTTPException(409, "Ten job już się wykonuje")
+
+    _running.add(job_id)
+
+    async def _runner():
+        try:
+            await coro
+        finally:
+            _running.discard(job_id)
+
+    asyncio.create_task(_runner())
+
+
+def _assert_plan_editable(job: aiosqlite.Row, scenes: list[dict]) -> None:
+    if job["status"] in BLOCKED_EDIT_STATUSES:
+        raise HTTPException(409, f"Nie można edytować planu w statusie: {job['status']}")
+    # Status alone is not enough: a job interrupted mid-generation sits in
+    # 'interrupted', yet its finished clips are real and paid for.
+    if any(s.get("status") == "done" for s in scenes):
+        raise HTTPException(
+            409, "Część scen jest już wygenerowana — edycja skasowałaby gotowe klipy"
+        )
 
 
 @router.post("/jobs")
@@ -107,30 +155,16 @@ async def list_jobs(
 
 @router.post("/jobs/{job_id}/plan")
 async def plan_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
-    if job["status"] not in ("uploaded", "error"):
+    if job["status"] not in ("uploaded", "error", "interrupted"):
         raise HTTPException(400, f"Job is already in status: {job['status']}")
 
-    # Build state
-    upload_dir = os.path.join(settings.data_dir, "uploads", job_id)
-    image_paths = sorted(
-        os.path.join(upload_dir, f)
-        for f in os.listdir(upload_dir)
-        if not f.endswith("_processed.jpg")
-    )
+    state = await job_state.load_state(job_id)
+    if state is None:
+        raise HTTPException(404, "Job not found")
+    if not state["image_paths"]:
+        raise HTTPException(400, "Brak zdjęć dla tego joba")
 
-    state = {
-        "job_id": job_id,
-        "prompt": job["prompt"],
-        "model": job["model"],
-        "aspect_ratio": job["aspect_ratio"],
-        "target_duration_s": job["target_duration_s"],
-        "image_paths": image_paths,
-    }
-
-    _job_states[job_id] = state
-
-    # Run planning in background
-    asyncio.create_task(run_planning(job_id, state))
+    _start(job_id, run_planning(job_id, state))
 
     return {"status": "planning"}
 
@@ -140,12 +174,11 @@ async def generate_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job))
     if job["status"] != "planned":
         raise HTTPException(400, f"Job must be in 'planned' status, got: {job['status']}")
 
-    state = _job_states.get(job_id)
-    if not state:
-        raise HTTPException(400, "Job state not found — please re-plan")
+    state = await job_state.load_state(job_id)
+    if state is None or not state["scenes"]:
+        raise HTTPException(400, "Brak planu dla tego joba")
 
-    # Run generation in background
-    asyncio.create_task(run_generation(job_id, state))
+    _start(job_id, run_generation(job_id, state))
 
     return {"status": "generating"}
 
@@ -156,38 +189,37 @@ async def update_scene(
     idx: int,
     sub_prompt: str = Form(...),
     duration_s: int = Form(...),
+    image_index: int = Form(...),
     job: aiosqlite.Row = Depends(get_owned_job),
 ):
-    """Allow user to edit a scene's sub_prompt or duration before generation."""
-    state = _job_states.get(job_id)
-    if not state or not state.get("scenes"):
-        raise HTTPException(400, "No plan found for this job")
+    """Allow user to edit a scene's sub_prompt, duration or source image."""
+    state = await job_state.load_state(job_id)
+    if state is None or not state["scenes"]:
+        raise HTTPException(400, "Brak planu dla tego joba")
+
+    _assert_plan_editable(job, state["scenes"])
 
     if idx < 0 or idx >= len(state["scenes"]):
         raise HTTPException(400, "Invalid scene index")
 
+    # Rejected here rather than in generate_clips: an out-of-range index would
+    # otherwise reach image_paths[...] inside a background task, surfacing to the
+    # user as a bare "error" status instead of a 400 on the request that caused it.
+    if image_index < 0 or image_index >= len(state["image_paths"]):
+        raise HTTPException(400, f"Nieprawidłowy indeks zdjęcia: {image_index}")
+
     state["scenes"][idx]["sub_prompt"] = sub_prompt
     state["scenes"][idx]["duration_s"] = duration_s
+    state["scenes"][idx]["image_index"] = image_index
 
-    # Recalculate cost
-    model = state["model"]
-    cost_per_sec = settings.model_costs.get(model, 0.05)
-    total_s = sum(s["duration_s"] for s in state["scenes"])
-    state["est_cost_usd"] = round(total_s * cost_per_sec, 2)
+    # Targeted UPDATE, not save_scenes: rewriting the whole list would reset
+    # every scene's status/clip_path for a one-field edit.
+    await job_state.update_scene_fields(job_id, idx, sub_prompt, duration_s, image_index)
 
-    # Update DB
-    db = await get_db()
-    await db.execute(
-        "UPDATE scenes SET sub_prompt=?, duration_s=? WHERE job_id=? AND idx=?",
-        (sub_prompt, duration_s, job_id, idx),
-    )
-    await db.execute(
-        "UPDATE jobs SET est_cost_usd=? WHERE id=?",
-        (state["est_cost_usd"], job_id),
-    )
-    await db.commit()
+    est_cost = job_state.recalc_cost(state["model"], state["scenes"])
+    await job_state.set_job_cost(job_id, est_cost)
 
-    return {"est_cost_usd": state["est_cost_usd"]}
+    return {"est_cost_usd": est_cost}
 
 
 class SceneItem(BaseModel):
@@ -208,37 +240,25 @@ async def sync_scenes(
     job: aiosqlite.Row = Depends(get_owned_job),
 ):
     """Replace the entire scene list (add/remove/reorder scenes)."""
-    state = _job_states.get(job_id)
-    if not state:
-        raise HTTPException(400, "Job state not found — please re-plan")
+    state = await job_state.load_state(job_id)
+    if state is None:
+        raise HTTPException(404, "Job not found")
+
+    _assert_plan_editable(job, state["scenes"])
 
     scenes = [s.model_dump() for s in body.scenes]
-    state["scenes"] = scenes
-    state["chain_flags"] = [s["chain_from_prev"] for s in scenes]
 
-    # Recalculate cost
-    model = state["model"]
-    cost_per_sec = settings.model_costs.get(model, 0.05)
-    total_s = sum(s["duration_s"] for s in scenes)
-    state["est_cost_usd"] = round(total_s * cost_per_sec, 2)
+    image_count = len(state["image_paths"])
+    for s in scenes:
+        if s["image_index"] < 0 or s["image_index"] >= image_count:
+            raise HTTPException(400, f"Nieprawidłowy indeks zdjęcia: {s['image_index']}")
 
-    # Update DB
-    db = await get_db()
-    await db.execute("DELETE FROM scenes WHERE job_id=?", (job_id,))
-    for i, s in enumerate(scenes):
-        await db.execute(
-            "INSERT INTO scenes (job_id, idx, image_path, sub_prompt, duration_s, chain_from_prev, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-            (job_id, i, f"image_{s['image_index']}", s["sub_prompt"], s["duration_s"],
-             1 if s.get("chain_from_prev") else 0),
-        )
-    await db.execute(
-        "UPDATE jobs SET est_cost_usd=? WHERE id=?",
-        (state["est_cost_usd"], job_id),
-    )
-    await db.commit()
+    await job_state.save_scenes(job_id, scenes)
 
-    return {"est_cost_usd": state["est_cost_usd"], "scene_count": len(scenes)}
+    est_cost = job_state.recalc_cost(state["model"], scenes)
+    await job_state.set_job_cost(job_id, est_cost)
+
+    return {"est_cost_usd": est_cost, "scene_count": len(scenes)}
 
 
 @router.get("/jobs/{job_id}")
@@ -251,6 +271,8 @@ async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
 
     return {
         "id": job["id"],
+        # The plan editor rebuilds its image picker from this after a restart.
+        "image_count": len(job_state.image_paths_for(job["id"])),
         "status": job["status"],
         "prompt": job["prompt"],
         "model": job["model"],
@@ -292,17 +314,143 @@ async def get_job_thumbnail(job: aiosqlite.Row = Depends(get_owned_job)):
     )
 
 
+@router.get("/jobs/{job_id}/images/{index}")
+async def get_job_image(index: int, job: aiosqlite.Row = Depends(get_owned_job)):
+    """One source image by scene `image_index`, for the rebuilt plan editor.
+
+    Traversal-free like get_job_thumbnail: the directory comes from job["id"] and
+    the file is picked positionally, so no client string reaches the filesystem.
+    """
+    paths = job_state.image_paths_for(job["id"])
+    if index < 0 or index >= len(paths):
+        raise HTTPException(404, "Brak zdjęcia")
+
+    path = paths[index]
+    return FileResponse(
+        path,
+        media_type=mimetypes.guess_type(path)[0] or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+def _assert_scene_retryable(job: aiosqlite.Row, scene: dict) -> None:
+    """Refuse a retry that makes no sense, with a 409.
+
+    `job["status"]` is the job's state ('uploaded' / 'planned' / 'generating' /
+    'stitching' / 'interrupted' / 'error' / 'done'); `scene["status"]` is one of
+    'pending' / 'done' / 'error'.
+    """
+    if job["status"] not in RETRYABLE_JOB_STATUSES:
+        raise HTTPException(409, f"Nie można powtórzyć sceny w statusie joba: {job['status']}")
+    if scene.get("status") != "error":
+        raise HTTPException(409, f"Nie można powtórzyć sceny w statusie: {scene.get('status')}")
+
+
+@router.post("/jobs/{job_id}/scenes/{idx}/retry")
+async def retry_scene(job_id: str, idx: int, job: aiosqlite.Row = Depends(get_owned_job)):
+    """Regenerate one failed scene, then carry the job on to stitching.
+
+    No dedicated generation path: clearing this row makes already_rendered()
+    return False for this scene and True for every other, so the ordinary
+    run_generation refills exactly the one gap. A scene later in the same chain
+    needs no cascade either — process_chain is sequential, so anything after a
+    failure never ran and is still 'pending'.
+    """
+    state = await job_state.load_state(job_id)
+    if state is None or not state["scenes"]:
+        raise HTTPException(400, "Brak planu dla tego joba")
+    if idx < 0 or idx >= len(state["scenes"]):
+        raise HTTPException(400, "Invalid scene index")
+
+    # Checked before the reset, not by letting _start() raise: refusing after
+    # the wipe would leave the scene cleared with nothing running to refill it.
+    if job_id in _running:
+        raise HTTPException(409, "Ten job już się wykonuje")
+
+    _assert_scene_retryable(job, state["scenes"][idx])
+
+    await job_state.reset_scene(job_id, idx)
+    # The status reset alone would be enough for already_rendered(), but a
+    # half-written file from a cancelled attempt must not outlive it.
+    clip = job_state.clip_path_for(job_id, idx)
+    for path in (clip, f"{clip}.part"):
+        if os.path.exists(path):
+            os.remove(path)
+
+    state = await job_state.load_state(job_id)
+    _start(job_id, run_generation(job_id, state))
+
+    return {"status": "generating", "idx": idx}
+
+
+def _decide_stage(job: aiosqlite.Row, scenes: list[dict]) -> str:
+    """Which pipeline stage a job should resume from.
+
+    Returns one of:
+      "planning"   — run validate + plan_scenes from scratch (no usable plan)
+      "planned"    — a plan exists; the user reviews it and presses Generuj
+      "generating" — resume generation (already-rendered scenes get skipped)
+      "done"       — nothing to do, the final mp4 exists
+
+    Only the first and third start a background task; the others just tell the
+    frontend which screen to show.
+    """
+    if job["status"] == "done":
+        return "done"
+
+    if not scenes:
+        return "planning"
+
+    if job["status"] in ("uploaded", "planned"):
+        return "planned"
+
+    return "generating"
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
+    """Restart an interrupted job from its last completed step."""
+    if job_id in _running:
+        raise HTTPException(409, "Ten job już się wykonuje")
+
+    state = await job_state.load_state(job_id)
+    if state is None:
+        raise HTTPException(404, "Job not found")
+
+    stage = _decide_stage(job, state["scenes"])
+
+    if stage == "planning":
+        await _set_status(job_id, "uploaded")
+        _start(job_id, run_planning(job_id, state))
+    elif stage == "generating":
+        _start(job_id, run_generation(job_id, state))
+    # "planned"/"done" need no task — the frontend just opens the right screen.
+
+    return {"stage": stage}
+
+
+async def _set_status(job_id: str, status: str) -> None:
+    db = await get_db()
+    await db.execute("UPDATE jobs SET status=?, error=NULL WHERE id=?", (status, job_id))
+    await db.commit()
+
+
 @router.get("/jobs/{job_id}/events")
 async def job_events(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     queue = get_event_queue(job_id)
 
     async def event_generator():
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=30)
-                yield {"event": event["type"], "data": json.dumps(event)}
-            except asyncio.TimeoutError:
-                yield {"event": "ping", "data": "{}"}
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield {"event": event["type"], "data": json.dumps(event)}
+                except asyncio.TimeoutError:
+                    yield {"event": "ping", "data": "{}"}
+        finally:
+            # A disconnecting client cancels this generator, so `finally` is the
+            # only place guaranteed to run — code after the loop never would.
+            release_event_queue(job_id, queue)
 
     return EventSourceResponse(event_generator())
 
