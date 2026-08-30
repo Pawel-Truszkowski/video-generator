@@ -121,6 +121,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 .btn-link:hover { color: #3a75e6; text-decoration: underline; }
 .btn-link:disabled { color: #555; cursor: default; text-decoration: none; }
+/* Muted until hover: "Usun" sits next to Pobierz/Odtworz and must not read as
+   the primary action on the card. */
+.btn-link.danger { color: #8a5560; }
+.btn-link.danger:hover { color: #e05260; }
 .login-box { max-width: 380px; margin: 48px auto; }
 .info-msg {
   color: #4f8cff; background: #1a2233; padding: 12px; border-radius: 6px;
@@ -151,7 +155,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
   margin-top: 6px; font-size: 0.75rem; color: #888;
 }
-.job-actions { display: flex; gap: 8px; margin-top: 8px; }
+.job-actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+/* Zajmuje miejsce po przycisku "Wznow", ktorego dla wyczyszczonego joba nie ma. */
+.job-note { color: #666; font-size: 0.75rem; padding: 4px 8px; font-style: italic; }
 .job-card video { width: 100%; margin-top: 8px; border-radius: 6px; }
 .status-badge.planned { background: #2d3748; color: #aaa; }
 .empty-state { color: #888; text-align: center; padding: 32px; }

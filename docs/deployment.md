@@ -144,6 +144,10 @@ Uzupelnij:
 - `RESEND_API_KEY` — z panelu Resend.
 - `SEMAPHORE_LIMIT=1` — zostaw. Na 1 vCPU 4 rownolegle lancuchy scen to 4 procesy
   ffmpeg naraz.
+- `MAX_ACTIVE_JOBS_PER_USER=1` — zostaw. Limit dotyczy **jednego uzytkownika**,
+  nie calej instancji: dwoch zalogowanych dalej moze generowac naraz.
+- `RETENTION_DAYS=7` / `CLEANUP_INTERVAL_H=24` — domyslne wartosci sa dobre.
+  Szczegoly tego, co znika a co zostaje, w §8.
 
 ---
 
@@ -253,27 +257,49 @@ Katalog `./data` jest woluminem i przezywa kazdy rebuild oraz `down`. Nie kasuj 
 
 ## 8. Dysk, backup, sprzatanie
 
-### To jest najwiekszy problem operacyjny tego wdrozenia
+### Co sprzata sie samo (od 0.5.0)
 
-Automatyczne czyszczenie plikow **nie jest zaimplementowane** (roadmap Faza 1.3,
-niezrobiona). Kazdy job zostawia na stale: oryginaly zdjec + wersje `_processed`,
-po jednym klipie na scene, klatki posrednie i gotowy film. Lokalnie ~29 MB przy
-garstce jobow — na 10 GB dysku dzielonym z systemem to kwestia tygodni, nie lat.
+Aplikacja ma wlasna petle retencji (`app/services/cleanup.py`), uruchamiana
+w `lifespan`. Nie wymaga wpisu w cronie — pierwszy przebieg leci przy starcie
+kontenera, kolejne co `CLEANUP_INTERVAL_H`.
 
-Monitoruj:
+| Co | Kiedy znika |
+|---|---|
+| `data/uploads/{job}`, `data/frames/{job}`, `data/clips/{job}` | automatycznie po `RETENTION_DAYS` (7) |
+| `data/stitch/{job}` (pliki robocze ffmpega) | kasowane od razu po stitchu; retencja to tylko zapas |
+| `data/final/{job}.mp4` | **nigdy sam** — tylko przycisk „Usun" w UI / `DELETE /jobs/{id}` |
+| katalog roboczy bez wiersza w bazie (sierota) | automatycznie, po tym samym progu wieku |
+
+Job po wyczyszczeniu **zostaje** w „Moje filmy": film dalej mozna odtworzyc
+i pobrac, tylko `Wznow` znika (zamiast niego napis `pliki usuniete`), bo kazda
+sciezka za tym przyciskiem potrzebuje zdjec zrodlowych.
+
+### To wciaz wymaga oka
+
+Retencja **nie dotyka gotowych filmow**, wiec `data/final` rosnie bez konca.
+Na 10 GB dzielonych z systemem to dalej jest zegar, tylko wolniejszy.
 
 ```bash
 du -sh /opt/video-generator/data/*
 df -h /
 ```
 
-Reczne sprzatanie plikow starszych niz 7 dni (**wiersze w bazie zostaja** — job
-bedzie widoczny w „Moje filmy" z martwym linkiem do pobrania):
+Wymuszenie sprzatania bez czekania na kolejny przebieg — po prostu restart:
+
+```bash
+docker compose -f docker-compose.prod.yml restart app
+docker compose -f docker-compose.prod.yml logs --tail=50 app | grep cleanup
+```
+
+Awaryjnie, gdy dysk jest juz pelny i aplikacja nie wstaje, reczny odpowiednik
+(**wiersze w bazie zostaja bez znacznika `workdirs_purged_at`**, wiec UI dalej
+zaoferuje `Wznow`, ktory padnie — to jest cena obejscia):
 
 ```bash
 find /opt/video-generator/data/frames  -type f -mtime +7 -delete
 find /opt/video-generator/data/clips   -type f -mtime +7 -delete
 find /opt/video-generator/data/uploads -type f -mtime +7 -delete
+find /opt/video-generator/data/stitch  -type f -mtime +1 -delete
 # data/final kasuj swiadomie - to gotowe filmy uzytkownikow
 ```
 

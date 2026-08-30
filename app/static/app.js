@@ -625,6 +625,9 @@
   // offers Odtworz/Pobierz.
   const RESUMABLE_STATUSES = ['uploaded', 'planned', 'interrupted', 'error'];
 
+  // Mirrors STALE_STATUSES on the server: a live task owns these jobs' files.
+  const BUSY_STATUSES = ['planning', 'generating', 'stitching'];
+
   function statusClass(s) {
     if (s === 'done') return 'done';
     if (s === 'error') return 'error';
@@ -723,6 +726,26 @@
     }
   }
 
+  /** Remove a job and its files for good. Server refuses while it is running. */
+  async function deleteJob(job, card) {
+    const label = job.prompt ? `"${job.prompt.slice(0, 60)}"` : 'ten job';
+    if (!confirm(`Usunac ${label} wraz z plikami? Tej operacji nie da sie cofnac.`)) return;
+
+    try {
+      const res = await apiFetch(`/jobs/${job.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await errText(res));
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      return;
+    }
+
+    // Drop just this card instead of reloading the list: a full reload would
+    // scroll the user back to the top of "Moje filmy" after every deletion.
+    card.remove();
+    if (jobId === job.id) { jobId = null; }
+    if (!jobsList.childElementCount) jobsEmpty.classList.remove('hidden');
+  }
+
   function renderJobCard(job) {
     const card = document.createElement('div');
     card.className = 'job-card';
@@ -786,7 +809,14 @@
       actions.appendChild(preview);
     }
 
-    if (RESUMABLE_STATUSES.includes(job.status)) {
+    // Every path behind "Wznow" needs the source images, and the retention sweep
+    // has taken them — the server would 409, so do not offer the button at all.
+    if (job.files_purged) {
+      const note = document.createElement('span');
+      note.className = 'job-note';
+      note.textContent = 'pliki usuniete';
+      actions.appendChild(note);
+    } else if (RESUMABLE_STATUSES.includes(job.status)) {
       const resume = document.createElement('button');
       resume.className = 'btn-link';
       resume.textContent = 'Wznow';
@@ -815,6 +845,15 @@
 
       actions.appendChild(play);
       actions.appendChild(dl);
+    }
+
+    // Hidden while a task owns the job's files — DELETE would 409 anyway.
+    if (!BUSY_STATUSES.includes(job.status)) {
+      const del = document.createElement('button');
+      del.className = 'btn-link danger';
+      del.textContent = 'Usun';
+      del.onclick = () => deleteJob(job, card);
+      actions.appendChild(del);
     }
 
     if (actions.childElementCount) info.appendChild(actions);

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 
 from app.config import settings
@@ -65,10 +66,15 @@ async def stitch_clips(
     clip_paths: list[str],
     chain_flags: list[bool],
     output_path: str,
+    work_dir: str,
 ) -> str:
     """
     Concatenate clips with crossfade between non-chained scenes.
     Chained clips (last-frame continuation) get hard cuts.
+
+    `work_dir` holds the normalized clips and the concat list. The caller picks
+    it and it must be unique per job — same rule as `out_path` for providers.
+    It is scratch, and this function removes it on the way out.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -83,7 +89,7 @@ async def stitch_clips(
         return output_path
 
     # Normalize all clips first
-    norm_dir = os.path.join(os.path.dirname(output_path), "normalized")
+    norm_dir = os.path.join(work_dir, "normalized")
     os.makedirs(norm_dir, exist_ok=True)
 
     norm_paths = []
@@ -125,7 +131,7 @@ async def stitch_clips(
     else:
         # Multi-clip: use concat for simplicity in POC
         # Create a concat file
-        concat_file = os.path.join(os.path.dirname(output_path), "concat.txt")
+        concat_file = os.path.join(work_dir, "concat.txt")
         with open(concat_file, "w") as f:
             for p in norm_paths:
                 f.write(f"file '{p}'\n")
@@ -139,11 +145,16 @@ async def stitch_clips(
             "-an", output_path,
         ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"stitch failed: {stderr.decode()}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"stitch failed: {stderr.decode()}")
+    finally:
+        # Also on failure: stderr is already in the exception and a retry
+        # re-normalizes from the clips anyway.
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     return output_path

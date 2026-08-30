@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 from contextlib import asynccontextmanager
@@ -11,8 +12,9 @@ from fastapi.staticfiles import StaticFiles
 
 from app.db import get_db, close_db
 from app.api.auth import router as auth_router
-from app.api.jobs import router as jobs_router
+from app.api.jobs import is_job_running, router as jobs_router
 from app.config import settings
+from app.services import cleanup
 from app.services.job_state import reconcile_interrupted
 
 
@@ -44,7 +46,19 @@ async def lifespan(app: FastAPI):
     stale = await reconcile_interrupted()
     if stale:
         print(f"[startup] {stale} przerwanych jobów oznaczonych jako 'interrupted'")
+
+    # After reconcile_interrupted(), never before: the sweep skips jobs in an
+    # active status, and until that call runs the jobs left by the dead process
+    # still wear one — it would skip exactly what it should be cleaning.
+    cleanup_task = asyncio.create_task(cleanup.retention_loop(is_job_running))
+
     yield
+
+    # Cancelled before close_db(): a loop woken during shutdown would otherwise
+    # find the connection gone and log a failed sweep on every clean stop.
+    cleanup_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cleanup_task
     await close_db()
 
 
@@ -99,11 +113,11 @@ async def health():
         checks["db"] = f"{type(exc).__name__}: {exc}"
         healthy = False
 
-    # Dysk. Realne ryzyko tego wdrozenia: czyszczenie plikow nie jest
-    # zaimplementowane (roadmap Faza 1.3), a jeden job zostawia oryginaly,
-    # wersje _processed, klatki, klipy i gotowy film. Prog jest twardy, bo
-    # ponizej niego generacja i tak padnie - lepiej wiedziec przed, niz
-    # zbierac polowe klipow po.
+    # Dysk. Retencja (app/services/cleanup.py) sprzata material roboczy starszy
+    # niz RETENTION_DAYS, ale gotowe filmy w data/final nie maja retencji i rosna
+    # w nieskonczonosc - a jeden job w trakcie zostawia jeszcze oryginaly, wersje
+    # _processed, klatki i klipy. Prog jest twardy, bo ponizej niego generacja i
+    # tak padnie - lepiej wiedziec przed, niz zbierac polowe klipow po.
     try:
         usage = shutil.disk_usage(settings.data_dir)
         free_mb = usage.free // (1024 * 1024)
