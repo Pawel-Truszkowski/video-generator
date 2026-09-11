@@ -34,6 +34,26 @@ def clips_dir(job_id: str) -> str:
     return os.path.join(settings.data_dir, "clips", job_id)
 
 
+def frames_dir(job_id: str) -> str:
+    """Last-frame stills for chained scenes. Only chained jobs ever create it."""
+    return os.path.join(settings.data_dir, "frames", job_id)
+
+
+def final_path(job_id: str) -> str:
+    """The finished film. Note this is a FILE, not a per-job directory."""
+    return os.path.join(settings.data_dir, "final", f"{job_id}.mp4")
+
+
+def stitch_dir(job_id: str) -> str:
+    """Scratch space for stitch(): normalized clips and the ffmpeg concat list.
+
+    Keyed by job_id, and deliberately not under data/final. Shared names there
+    meant two concurrent stitches overwrote each other's frames and produced a
+    film spliced from both jobs, with no error anywhere (fixed in 0.5.0).
+    """
+    return os.path.join(settings.data_dir, "stitch", job_id)
+
+
 def clip_path_for(job_id: str, idx: int) -> str:
     """Where scene `idx` of job `job_id` stores its rendered clip.
 

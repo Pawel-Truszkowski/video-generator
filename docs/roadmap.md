@@ -35,10 +35,23 @@ Zaleznosci: brak
       w `job_events`, klucz `job_id` znika po ostatnim subskrybencie, kolejka ma
       `maxsize=100`, a `_emit()` wyrejestrowuje kolejke, ktorej nikt nie opróznia.
 
-### 1.3 Czyszczenie danych
-- [ ] Task/cron kasujacy pliki (clips, uploads, frames) starsze niz 7 dni
-- [ ] Endpoint `DELETE /jobs/{id}` — usuwanie joba + plikow
-- [ ] Limit jednoczesnych jobow per uzytkownik (np. 3)
+### 1.3 Czyszczenie danych — ZROBIONE (0.5.0)
+- [x] Task kasujacy pliki (clips, uploads, frames) starsze niz `RETENTION_DAYS` (7)
+      — petla asyncio w `lifespan`, nie cron: dziala tez lokalnie i nie wymaga
+      instalacji na kazdym nowym serwerze. Pierwszy przebieg przy starcie
+- [x] **`data/final/*.mp4` NIE ma retencji** — to produkt uzytkownika. Znika
+      wylacznie przez `DELETE /jobs/{id}`
+- [x] Sweep sierot: katalog roboczy bez wiersza w `jobs` (przerwany DELETE,
+      reczne `rm` na serwerze). Prog wieku jest konieczny, bo `create_job`
+      tworzy `uploads/{job_id}` przed INSERT-em
+- [x] Kolumna `jobs.workdirs_purged_at` — bez niej „brak plikow" jest
+      nieodroznialne od „job nigdy ich nie mial", a `Wznow` na starym jobie
+      padal w tle jako goly `error`
+- [x] Endpoint `DELETE /jobs/{id}` — usuwanie joba + plikow (baza przed dyskiem;
+      resztki lapie sweep sierot). Przycisk „Usun" w „Moje filmy"
+- [x] Limit jednoczesnych jobow per uzytkownik (`MAX_ACTIVE_JOBS_PER_USER`,
+      domyslnie 3, prod 1) — liczony z `_running`, nie z bazy: dict czyta sie
+      synchronicznie, `SELECT COUNT(*)` otwiera okno wyscigu na `await`
 
 ---
 
