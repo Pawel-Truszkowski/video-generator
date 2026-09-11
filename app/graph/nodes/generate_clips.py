@@ -5,10 +5,11 @@ import os
 from typing import Awaitable, Callable
 
 from app.config import settings
+from app.providers.base import ProviderError
 from app.providers.mock_provider import MockProvider
 from app.providers.fal_provider import FalProvider
 from app.services.ffmpeg import extract_last_frame
-from app.services.job_state import clip_path_for, clips_dir
+from app.services.job_state import clip_path_for, clips_dir, frames_dir
 
 SceneDone = Callable[[int, str], Awaitable[None]]
 SceneError = Callable[[int, str], Awaitable[None]]
@@ -47,8 +48,8 @@ async def generate_clips(
     semaphore = asyncio.Semaphore(settings.semaphore_limit)
 
     clip_paths: list[str | None] = [None] * len(scenes)
-    frames_dir = os.path.join(settings.data_dir, "frames", job_id)
-    os.makedirs(frames_dir, exist_ok=True)
+    frames = frames_dir(job_id)
+    os.makedirs(frames, exist_ok=True)
     os.makedirs(clips_dir(job_id), exist_ok=True)
 
     # Group scenes into chains: sequences where chain_from_prev=True
@@ -115,15 +116,21 @@ async def generate_clips(
                 except Exception as e:
                     # TimeoutError stringifies to '', so naming it is the only
                     # way the message says anything at all.
-                    reason = (
-                        f"przekroczono limit {timeout:g}s"
-                        if isinstance(e, asyncio.TimeoutError)
-                        else f"{type(e).__name__}: {e}"
-                    )
-                    if attempt == settings.clip_max_retries:
+                    if isinstance(e, asyncio.TimeoutError):
+                        reason = f"przekroczono limit {timeout:g}s"
+                    elif isinstance(e, ProviderError):
+                        # Already user-facing; the class name would only be noise.
+                        reason = str(e)
+                    else:
+                        reason = f"{type(e).__name__}: {e}"
+                    # A rejected input fails identically every time, so the
+                    # remaining attempts would only add minutes of waiting.
+                    give_up = isinstance(e, ProviderError) and not e.retryable
+                    if give_up or attempt == settings.clip_max_retries:
+                        tries = "próbie" if attempt == 0 else "próbach"
                         msg = (
                             f"Scena {idx + 1} nie powiodła się po "
-                            f"{settings.clip_max_retries + 1} próbach: {reason}"
+                            f"{attempt + 1} {tries}: {reason}"
                         )
                         scene["status"] = "error"
                         if on_scene_error:
@@ -140,7 +147,7 @@ async def generate_clips(
                 # Extract last frame from previous clip — works for a skipped
                 # scene too, its clip file is on disk either way.
                 prev_clip = clip_paths[chain_indices[i - 1]]
-                frame_path = os.path.join(frames_dir, f"frame_{chain_indices[i-1]}.png")
+                frame_path = os.path.join(frames, f"frame_{chain_indices[i-1]}.png")
                 await extract_last_frame(prev_clip, frame_path)
                 input_image = frame_path
 

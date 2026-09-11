@@ -30,7 +30,21 @@ class Settings:
 
     max_upload_mb: int = 10
     max_images: int = 30
-    semaphore_limit: int = 4
+
+    # --- Czyszczenie danych (Faza 1.3) ---
+    # Po ilu dniach od utworzenia joba znika jego material roboczy (uploads,
+    # frames, clips). Gotowy film w data/final NIE jest kasowany przez retencje --
+    # to produkt uzytkownika, znika dopiero przy DELETE /jobs/{id}.
+    retention_days: int = field(default_factory=lambda: int(os.getenv("RETENTION_DAYS", "7")))
+    # Z env wylacznie po to, zeby dalo sie to przetestowac bez czekania dobe.
+    cleanup_interval_h: float = field(default_factory=lambda: float(os.getenv("CLEANUP_INTERVAL_H", "24")))
+    # Ile jobow jednego uzytkownika moze pracowac naraz. Na 1 vCPU kazdy aktywny
+    # job to wlasny zestaw procesow ffmpeg -- i wlasny rachunek u providera.
+    max_active_jobs_per_user: int = field(default_factory=lambda: int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "3")))
+    # Ile lancuchow scen leci rownolegle. Env-driven, bo to jedyny parametr,
+    # ktory trzeba zejsc na maszynie o 1 vCPU / 1 GB RAM: kazdy rownolegly
+    # lancuch to wlasny proces ffmpeg przy normalizacji klipu.
+    semaphore_limit: int = field(default_factory=lambda: int(os.getenv("SEMAPHORE_LIMIT", "4")))
     clip_poll_interval: float = 5.0
     clip_max_retries: int = 2
     # Ceiling for one provider call. Without it a provider that never answers

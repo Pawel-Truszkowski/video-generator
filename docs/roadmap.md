@@ -35,10 +35,23 @@ Zaleznosci: brak
       w `job_events`, klucz `job_id` znika po ostatnim subskrybencie, kolejka ma
       `maxsize=100`, a `_emit()` wyrejestrowuje kolejke, ktorej nikt nie opróznia.
 
-### 1.3 Czyszczenie danych
-- [ ] Task/cron kasujacy pliki (clips, uploads, frames) starsze niz 7 dni
-- [ ] Endpoint `DELETE /jobs/{id}` — usuwanie joba + plikow
-- [ ] Limit jednoczesnych jobow per uzytkownik (np. 3)
+### 1.3 Czyszczenie danych — ZROBIONE (0.5.0)
+- [x] Task kasujacy pliki (clips, uploads, frames) starsze niz `RETENTION_DAYS` (7)
+      — petla asyncio w `lifespan`, nie cron: dziala tez lokalnie i nie wymaga
+      instalacji na kazdym nowym serwerze. Pierwszy przebieg przy starcie
+- [x] **`data/final/*.mp4` NIE ma retencji** — to produkt uzytkownika. Znika
+      wylacznie przez `DELETE /jobs/{id}`
+- [x] Sweep sierot: katalog roboczy bez wiersza w `jobs` (przerwany DELETE,
+      reczne `rm` na serwerze). Prog wieku jest konieczny, bo `create_job`
+      tworzy `uploads/{job_id}` przed INSERT-em
+- [x] Kolumna `jobs.workdirs_purged_at` — bez niej „brak plikow" jest
+      nieodroznialne od „job nigdy ich nie mial", a `Wznow` na starym jobie
+      padal w tle jako goly `error`
+- [x] Endpoint `DELETE /jobs/{id}` — usuwanie joba + plikow (baza przed dyskiem;
+      resztki lapie sweep sierot). Przycisk „Usun" w „Moje filmy"
+- [x] Limit jednoczesnych jobow per uzytkownik (`MAX_ACTIVE_JOBS_PER_USER`,
+      domyslnie 3, prod 1) — liczony z `_running`, nie z bazy: dict czyta sie
+      synchronicznie, `SELECT COUNT(*)` otwiera okno wyscigu na `await`
 
 ---
 
@@ -105,17 +118,25 @@ Zaleznosci: Faza 2 (konta uzytkownikow)
 Priorytet: WYSOKI
 Zaleznosci: Faza 1
 
-### 4.1 Serwer produkcyjny
-- [ ] VPS (Hetzner/DigitalOcean) — min. 2 vCPU, 4 GB RAM, 80 GB SSD
-- [ ] Docker Compose na serwerze (ten sam co teraz)
-- [ ] Domena + DNS
-- [ ] Caddy jako reverse proxy (automatyczny HTTPS)
-- [ ] Volume dla `/data` — persystentny miedzy deployami
+### 4.1 Serwer produkcyjny — PRZYGOTOWANE (0.4.1), wdrozenie reczne
+- [x] VPS — **Mikrus 2.1** (1 vCPU, ~1 GB RAM, ~10 GB dysku), nie Hetzner/DO.
+      Duzo ciasniej niz zakladal pierwotny wpis, stad `SEMAPHORE_LIMIT` i swap
+- [x] Osobny `docker-compose.prod.yml` (nie ten sam co lokalnie): bez bind-mounta
+      `./app`, z `restart: unless-stopped`, healthcheckiem i limitem logow
+- [x] Domena — subdomena z panelu Mikrusa wskazujaca na port 30108
+- [x] ~~Caddy jako reverse proxy~~ — HTTPS terminuje proxy Mikrusa.
+      Let's Encrypt wymagalby portow 80/443, ktorych na Mikrusie nie ma
+- [x] Volume dla `/data` — persystentny miedzy deployami (bez zmian)
+- [ ] Samo wdrozenie na serwerze — instrukcja: `docs/deployment.md`
 
 ### 4.2 Backup i monitoring
-- [ ] Backup SQLite co 24h (kopia na S3 lub osobny dysk)
-- [ ] Logi do pliku + rotacja (logrotate)
-- [ ] Healthcheck endpoint `GET /health`
+- [x] Backup SQLite co 24h — `scripts/backup-db.sh` (cron), `sqlite3.backup()`
+      zamiast `cp`, rotacja 7 dni. **Kopia ladzie na tym samym dysku** — chroni
+      przed uszkodzeniem bazy, nie przed utrata VPS-a
+- [x] ~~Logi do pliku + rotacja (logrotate)~~ — `json-file` z `max-size: 10m`,
+      `max-file: 3`. Logrotate nie jest potrzebny, docker rotuje sam
+- [x] Healthcheck endpoint `GET /health` — sprawdza baze (`SELECT 1` z wlasnym
+      timeoutem) i wolne miejsce w `data_dir`; 503 gdy ktorykolwiek zawiedzie
 - [ ] Powiadomienie (email/Slack) gdy job upadnie
 
 ### 4.3 Deploy flow

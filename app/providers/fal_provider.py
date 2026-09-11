@@ -5,8 +5,57 @@ import base64
 import os
 
 import fal_client
+# Not re-exported from the package root in fal-client 0.5.6.
+from fal_client.client import FalClientError
 
 from app.config import settings
+from app.providers.base import ProviderError
+
+
+def _translate_fal_error(e: FalClientError) -> ProviderError:
+    """Turn a fal.ai error into a message the user can read.
+
+    `e.args[0]` is whatever fal put under "detail" in the error response
+    (fal_client.client._raise_for_status): for a 422 a list of dicts like
+        {'loc': ['body', 'image_url'], 'msg': '...',
+         'type': 'content_policy_violation', 'input': {...the whole request...}}
+    but a plain string for other failures, or the raw response text when the
+    body was not JSON.
+    """
+    detail = e.args[0] if e.args else ""
+
+    # Not a validation list: a 4xx/5xx with a plain message or a non-JSON body.
+    # Usually transient, so worth another attempt. Cut last -- the string can
+    # still carry an echo of the request.
+    if not isinstance(detail, list):
+        return ProviderError(f"Błąd fal.ai: {str(detail)[:300]}", retryable=True)
+
+    for item in detail:
+        if not isinstance(item, dict):
+            return ProviderError(f"Błąd fal.ai: {str(item)[:300]}", retryable=True)
+
+        if item.get("type") == "content_policy_violation":
+            field = (item.get("loc") or ["?"])[-1]
+            if field == "image_url":
+                hint = (
+                    "fal.ai odrzucił obraz wejściowy (filtr treści). Ponowienie "
+                    "z tym samym obrazem nie pomoże — zmień obraz sceny albo "
+                    "wyłącz łączenie z poprzednią sceną."
+                )
+            else:
+                hint = (
+                    f"fal.ai odrzucił pole '{field}' (filtr treści). "
+                    "Zmień opis sceny i spróbuj ponownie."
+                )
+            return ProviderError(hint, retryable=False)
+
+    # Any other 422: the request does not match the endpoint's schema, which
+    # fails identically on every attempt. `input` is never read -- that is
+    # where fal echoes the base64 image.
+    first = detail[0] if detail else {}
+    field = (first.get("loc") or ["?"])[-1]
+    msg = str(first.get("msg") or "nieprawidłowa wartość")[:200]
+    return ProviderError(f"fal.ai odrzucił pole '{field}': {msg}", retryable=False)
 
 
 def _map_duration(model: str, duration_s: int) -> str:
@@ -95,12 +144,15 @@ class FalProvider:
                 for log in update.logs:
                     print(f"  [fal] {log.get('message', log)}")
 
-        result = await fal_client.subscribe_async(
-            endpoint,
-            arguments=arguments,
-            with_logs=True,
-            on_queue_update=on_queue_update,
-        )
+        try:
+            result = await fal_client.subscribe_async(
+                endpoint,
+                arguments=arguments,
+                with_logs=True,
+                on_queue_update=on_queue_update,
+            )
+        except FalClientError as e:
+            raise _translate_fal_error(e) from e
 
         # Download to a temporary name and move into place only once complete:
         # out_path existing is what a resume reads as "this scene is done".

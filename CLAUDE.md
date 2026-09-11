@@ -13,6 +13,8 @@ cp .env.example .env            # fill in FAL_KEY / OPENAI_API_KEY / ANTHROPIC_A
 docker compose up --build       # serves on http://localhost:8000, live-reloads (./app is bind-mounted)
 ```
 
+Production runs from a **second compose file**, `docker-compose.prod.yml` (`docker compose -f docker-compose.prod.yml up -d --build`): no `./app` bind-mount, so a `git pull` without `--build` changes nothing; plus `restart: unless-stopped`, a `/health` healthcheck, capped json-file logs and `mem_limit`. Deployment target and its constraints are in `docs/deployment.md`; `.env.prod.example` is the server-side env template.
+
 Note the container does **not** hot-reload Python (uvicorn runs without `--reload`) — `./app` is bind-mounted, but you must `docker compose restart app` for backend changes. Static files under `app/static/` *are* served live; hard-reload the browser to bust its cache.
 
 There is no local (non-Docker) run path documented and no test suite — `app.js`/pytest/etc. are not present. Validate changes by running the container and exercising the API/UI directly (see "Manual verification" below).
@@ -39,7 +41,7 @@ Schema changes to existing tables go in `_migrate()` in `app/db.py`, not in the 
 
 ## Architecture
 
-**Despite `langgraph`/`langgraph-checkpoint-sqlite` being in `requirements.txt`, the pipeline is NOT built on LangGraph** — `app/graph/pipeline.py` just calls the four node functions directly as plain async functions with manual state-dict merging and SSE event emission. There's no graph and no checkpointing; resume exists but is hand-rolled against SQLite (see "Job state" below), not LangGraph's `interrupt()`. Don't assume LangGraph APIs are in play when reading `app/graph/`.
+**The pipeline is NOT built on LangGraph** despite the `app/graph/` directory name (`langgraph`/`langgraph-checkpoint-sqlite` were dropped from `requirements.txt` in 0.4.1 — nothing imported them, and the install footprint mattered on a 1 GB VPS) — `app/graph/pipeline.py` just calls the four node functions directly as plain async functions with manual state-dict merging and SSE event emission. There's no graph and no checkpointing; resume exists but is hand-rolled against SQLite (see "Job state" below), not LangGraph's `interrupt()`. Don't assume LangGraph APIs are in play when reading `app/graph/`.
 
 Request flow:
 
@@ -63,14 +65,53 @@ Four rules that fall out of that, and are easy to break:
 1. **A scene is "done" if its file is on disk, not if the DB says so.** `already_rendered()` (`generate_clips.py`) requires `status='done'` **and** `os.path.exists(clip_path_for(job_id, idx))` **and** a non-zero size. `clip_path_for` is a pure function of `(job_id, idx)` → `data/clips/{job_id}/scene_{idx:03d}.mp4`; the `scenes.clip_path` column is written but deliberately never read back, because pre-0.3.0 rows point at `uuid4()` names that `stitch` would never find. Providers therefore take `out_path` from the caller and must overwrite it, so a retry is idempotent.
 2. **Persist per scene, not per node.** `generate_clips` reports each finished clip through the `on_scene_done` / `on_scene_error` callbacks; that's what makes a crash on scene 5 keep scenes 0-4 recorded (and unpaid-for a second time).
 3. **`planning`/`generating`/`stitching` can only exist while a task is alive** (`STALE_STATUSES`). `reconcile_interrupted()` runs in `lifespan` and flips any it finds to `interrupted` — safe only because this is a single uvicorn worker in a single container. `_running: set[str]` in `app/api/jobs.py` guards double-starts; losing it on restart is correct, not a bug.
-4. **A `planned` job never resumes into generation by itself.** `_decide_stage()` returns `planning`/`planned`/`generating`/`done`; only the first and third start a task, because pressing *Generuj* is what spends money. A job that failed on one scene resumes as `generating`, not `planning` — replanning calls `save_scenes`, which is DELETE+INSERT and would drop paid-for clips. For the same reason plan edits are rejected with 409 once any scene has `status='done'`, not just on job status.
+4. **Only `app/services/cleanup.py` deletes a job's files.** It takes every path
+   from `job_state` (`uploads_dir`, `frames_dir`, `clips_dir`, `final_path`) — a
+   second place building those paths would silently stop matching what the pipeline
+   writes. Two rules inside it: retention removes only the *work* material
+   (uploads/frames/clips), never `data/final/*.mp4`, which goes away solely through
+   `DELETE /jobs/{id}`; and anything that deletes both a row and files does the
+   **row first** — leftover files are invisible and the orphan sweep collects them,
+   whereas a leftover row shows up in "Moje filmy" offering buttons that can only
+   fail. The orphan sweep's age threshold is load-bearing, not cautious:
+   `create_job` makes `uploads/{job_id}` *before* the INSERT, so a job mid-upload
+   momentarily looks exactly like an orphan.
+5. **`jobs.workdirs_purged_at` is the only way to tell "cleaned" from "never had
+   files".** `os.path.exists() == False` conflates purged / never-existed /
+   unmounted volume, and those need different answers. `_assert_files_present()`
+   in `app/api/jobs.py` turns it into a 409 on plan/generate/resume/retry; without
+   it `Wznow` on an old job passes `_decide_stage()` and dies in a background task
+   as a bare `error`.
+6. **`_running` (`app/api/jobs.py`) is `dict[job_id, user_id]` and the per-user
+   concurrency limit is counted from it, not from the DB.** The dict is read and
+   written synchronously, so two concurrent requests cannot interleave between the
+   check and the insert in `_start()`; a `SELECT COUNT(*)` over the active statuses
+   would `await` right there and let a double-click past the limit.
+7. **A `planned` job never resumes into generation by itself.** `_decide_stage()` returns `planning`/`planned`/`generating`/`done`; only the first and third start a task, because pressing *Generuj* is what spends money. A job that failed on one scene resumes as `generating`, not `planning` — replanning calls `save_scenes`, which is DELETE+INSERT and would drop paid-for clips. For the same reason plan edits are rejected with 409 once any scene has `status='done'`, not just on job status.
+
+### Data retention (roadmap Faza 1.3, shipped in 0.5.0)
+
+`cleanup.retention_loop()` is started in `lifespan` (`app/main.py`) — an asyncio
+task, not cron, so it works locally and needs no per-server install. It runs a
+sweep immediately at startup, then every `CLEANUP_INTERVAL_H` hours, which makes
+`docker compose restart app` the supported way to force a cleanup (set
+`RETENTION_DAYS=0` to purge everything on the next restart when testing). It is
+started **after** `reconcile_interrupted()`: the sweep skips jobs in an active
+status, and before that call jobs from the dead process still wear one.
 
 ### Pipeline stages (`app/graph/nodes/`)
 
 1. **validate** — format/size checks, Pillow RGB convert + letterbox-resize to `settings.output_width/height` (1280×720), writes `*_processed.jpg` next to originals.
 2. **plan_scenes** — LLM call (OpenAI gpt-4o-mini first, Anthropic Claude Sonnet 4 fallback, algorithmic `_mock_plan` last resort) turns the prompt + image count into a JSON scene list (`image_index`, `sub_prompt`, `duration_s` ∈ {5,10}, `chain_from_prev`). Also computes `est_cost_usd` from `settings.model_costs`.
 3. **generate_clips** — groups scenes into chains on `chain_from_prev`; chains run in parallel (`asyncio.Semaphore(settings.semaphore_limit)`, default 4), scenes within a chain run sequentially because each needs the previous clip's last frame (`extract_last_frame`, ffmpeg) as its input image. Retries each scene up to `settings.clip_max_retries` times.
-4. **stitch** — normalizes all clips to a common fps/resolution/codec, then joins them: `xfade` crossfade (`settings.crossfade_duration`) between independent scenes, hard concat within a chain (motion continuity would make a crossfade look wrong). The multi-clip (>2) path currently always uses plain concat rather than per-pair xfade — see the `else` branch in `stitch_clips` (`app/services/ffmpeg.py`).
+4. **stitch** — writes its scratch (normalized clips + the ffmpeg concat list) to
+   `data/stitch/{job_id}/`, supplied by the node as `work_dir` and removed in a
+   `finally`. Never to `data/final`: until 0.5.0 those files were named
+   `normalized/norm_{i}.mp4` and `concat.txt` with no job id in them, so two
+   concurrent stitches overwrote each other and produced a film spliced from both
+   jobs with no error — and `data/final` is the one directory retention must never
+   sweep by age, so the leftovers were unreachable. It normalizes all clips to a
+   common fps/resolution/codec, then joins them: `xfade` crossfade (`settings.crossfade_duration`) between independent scenes, hard concat within a chain (motion continuity would make a crossfade look wrong). The multi-clip (>2) path currently always uses plain concat rather than per-pair xfade — see the `else` branch in `stitch_clips` (`app/services/ffmpeg.py`).
 
 ### Provider abstraction
 

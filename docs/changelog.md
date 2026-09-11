@@ -1,5 +1,164 @@
 # Changelog
 
+## [0.5.0] — 2026-08-30 — Czyszczenie danych (roadmap Faza 1.3)
+
+Zamyka oba ryzyka wdrozeniowe wpisane w 0.4.1: brak czyszczenia plikow i brak
+limitu jobow na uzytkownika.
+
+### Retencja materialu roboczego
+- `app/services/cleanup.py` — **jedyne miejsce w aplikacji, ktore kasuje pliki joba**.
+  Sciezki bierze wylacznie z `job_state` (`uploads_dir`, `frames_dir`, `clips_dir`,
+  `final_path`); wlasne budowanie sciezek rozjechaloby sie z tym, co pipeline
+  naprawde zapisal, a skutkiem byloby ciche niesprzatanie polowy danych
+- Petla `retention_loop` startuje w `lifespan`, pierwszy przebieg **od razu przy
+  starcie** — restart kontenera jest pelnoprawnym sposobem wymuszenia sprzatania.
+  Odpalana po `reconcile_interrupted()`, nie przed: sweep pomija joby w statusie
+  aktywnym, a przed tym wywolaniem joby po martwym procesie wciaz taki nosza
+- `RETENTION_DAYS` (7), `CLEANUP_INTERVAL_H` (24) — druga zmienna istnieje po to,
+  zeby dalo sie to przetestowac bez czekania dobe
+
+### Gotowe filmy nie maja retencji
+- Kasowany jest **tylko material roboczy** (`uploads`, `frames`, `clips`).
+  `data/final/*.mp4` zostaje bezterminowo i znika wylacznie przez `DELETE`.
+  To swiadomy podzial: material roboczy jest kilka razy wiekszy i po tygodniu
+  sluzy juz tylko do wznowienia joba, ktorego nikt nie wznowi — a film jest
+  produktem, za ktory ktos zaplacil
+- Konsekwencja: dysk **dalej rosnie**, wolniej. `/health` zostaje jako ostrzezenie
+
+### Kolumna `jobs.workdirs_purged_at`
+- Migracja w `_migrate()`; stare wiersze zostaja `NULL`, czyli „jeszcze nie sprzatany"
+- Nie jest optymalizacja. `os.path.exists() == False` jest wieloznaczne — „skasowane
+  przez retencje" / „nigdy nie bylo" / „wolumin sie nie zamontowal" wymagaja innej
+  odpowiedzi. Bez tego rozroznienia `Wznow` na starym jobie przechodzil przez
+  `_decide_stage()` → `generating` i padal w tle jako goly `error`
+- `_assert_files_present()` odmawia z 409 w `plan`, `generate`, `resume`, `retry`.
+  Podglad listy scen dziala dalej (`renderSceneProgress` nie laduje obrazkow)
+
+### Sweep sierot
+- Katalog roboczy, ktorego `job_id` nie ma juz w tabeli `jobs` — skutek `DELETE`
+  przerwanego miedzy baza a dyskiem albo recznego `rm` na serwerze
+- **Prog wieku jest tu konieczny, nie ostrozny**: `create_job` tworzy
+  `uploads/{job_id}` PRZED INSERT-em, wiec job w trakcie wgrywania zdjec przez
+  chwile wyglada dokladnie jak sierota
+
+### `DELETE /jobs/{id}`
+- `Depends(get_owned_job)`, wiec cudzy job to **404, nie 403** — jak reszta API
+- 409 gdy job jest w `_running` albo w statusie aktywnym
+- **Kolejnosc: baza przed dyskiem.** Obie kolejnosci maja tryb awarii przy
+  padnieciu w polowie, ale nierowny: osierocone pliki sa niewidoczne i lapie je
+  sweep, a osierocony wiersz jest widoczny w „Moje filmy" i daje uzytkownikowi
+  przyciski, ktore moga tylko zawiesc
+- UI: przycisk „Usun" (ukryty w trakcie pracy joba), `confirm()`, usuniecie samej
+  karty zamiast przeladowania listy — przeladowanie przewijaloby na gore
+
+### Limit jednoczesnych jobow
+- `MAX_ACTIVE_JOBS_PER_USER` (3; produkcyjne `.env` ustawia 1)
+- `_running: set[str]` → `dict[str, str]` (`job_id` → `user_id`). Ta sama
+  struktura odpowiada na oba pytania API: „czy ten job juz chodzi?" i „ile jobow
+  tego uzytkownika chodzi?"
+- Licznik z `_running`, **nie** `SELECT COUNT(*)` po statusach: dict czyta sie i
+  zapisuje synchronicznie, wiec dwa rownolegle requesty nie przepleta sie miedzy
+  sprawdzeniem a wpisem. Zapytanie do bazy w tym samym miejscu robi `await` i
+  otwiera dokladnie to okno — podwojny klik przepuszczalby job ponad limit
+- Sprawdzenie w `_start()`, czyli w jedynej bramie kazdego taska (plan / generate
+  / resume / retry) — trasa dodana pozniej jest objeta limitem za darmo
+- `retry_scene` sprawdza limit **przed** skasowaniem klipu; odmowa po skasowaniu
+  zostawilaby scene wyczyszczona i nic, co ja odtworzy
+
+### Kolizja nazw w stitchu (znalezione przy sprzataniu)
+
+- `stitch_clips` pisalo pliki robocze prosto do `data/final/`: `normalized/norm_{i}.mp4`
+  i `concat.txt` — **nazwy bez `job_id`**. Dwa joby stitchujace jednoczesnie
+  nadpisywaly sobie te same pliki i film wychodzil posklejany z obu, bez zadnego
+  bledu. `SEMAPHORE_LIMIT=1` przed tym nie chronil: ogranicza sceny w obrebie
+  jednego joba, a nie dwoch uzytkownikow generujacych rownolegle
+- Drugi skutek: `data/final` jest jedynym katalogiem, ktorego retencja nie moze
+  ruszac po wieku (kazdy plik ma tam wlasciciela), wiec te smieci byly nieusuwalne
+  — `norm_10.mp4` z 27 lipca lezal tam do dzis
+- Teraz `data/stitch/{job_id}/`, kasowany w `finally` po ffmpegu (takze po bledzie:
+  stderr jest juz w wyjatku, a retry i tak normalizuje od nowa). Katalog dolaczyl
+  do `WORK_SUBDIRS`, wiec sweep jest zapasem na wypadek smierci procesu w trakcie
+- `stitch_clips` dostaje `work_dir` od wolajacego, nie buduje go sam — ta sama
+  zasada, co `out_path` u providerow: sciezki wybiera ten, kto zna `job_id`
+- Zweryfikowane dwoma rownoleglymi jobami roznych uzytkownikow na rozlacznych
+  kolorach: kazdy film zawiera wylacznie wlasne klatki
+
+### Porzadki bazy
+
+- Usuniete 11 jobow z `user_id IS NULL` (jeden batch z 2026-08-01, sprzed
+  wprowadzenia kont w 0.2.0). Byly **juz niewidoczne** dla kazdego uzytkownika,
+  bo `WHERE user_id = ?` nigdy ich nie lapalo — wiec nikt nic nie stracil
+- Skasowane przez `cleanup.purge_all()`, nie samym SQL-em: `data/final` nie
+  podlega ani retencji, ani sweepowi sierot, wiec 6 filmow (17,8 MB) zostaloby
+  trwalymi smieciami
+- Praktyczny skutek: `jobs.user_id` nie ma juz zadnego NULL-a, a `create_job`
+  nie potrafi go stworzyc — kod czytajacy `job["user_id"]` moze traktowac je
+  jako obecne. Kopia sprzed operacji: `data/video_gen.db.pre-purge`
+
+### Porzadki przy okazji
+- `frames_dir()` i `final_path()` przeniesione do `job_state` — byly budowane
+  inline w `generate_clips` i `stitch`, a cleanup bylby trzecim miejscem z wlasna
+  kopia tej samej sciezki
+- Indeks `idx_jobs_purge(workdirs_purged_at, created_at)` — bez niego sweep to
+  full scan po calej tabeli co dobe
+
+## [0.4.1] — 2026-08-29 — Przygotowanie do deployu na VPS (roadmap Faza 4)
+
+Cel: uruchomienie na Mikrusie 2.1 (1 vCPU, ~1 GB RAM, ~10 GB dysku) pod publicznym
+HTTPS. Maszyna jest znaczaco mniejsza niz zakladala Faza 4.1, wiec wiekszosc zmian
+to nie kosmetyka deployowa, tylko zejscie z zasobami.
+
+### Osobny compose produkcyjny
+- `docker-compose.prod.yml` — port `30108:8000` (Mikrus przekierowuje
+  `bob108.mikrus.xyz:30108` na `192.168.1.108:30108`)
+- **Bez bind-mounta `./app`.** Lokalnie kontener czyta kod z dysku hosta; na serwerze
+  znaczyloby to, ze niedokonczony `git pull` albo edycja w edytorze natychmiast trafia
+  do zywej aplikacji. Bez mounta jedyna droga zmiany kodu jest `--build`
+- `restart: unless-stopped` (powrot po reboocie i po OOM-killu), `mem_limit: 700m`
+  (pod LXC bywa ignorowany — `docker inspect` pokazuje wtedy `0`), logi `json-file`
+  ograniczone do 3 × 10 MB, zeby nie zjadly dysku dzielonego z plikami wideo
+- `--proxy-headers` w uvicornie — za proxy Mikrusa request przychodzi po http
+
+### Endpoint `/health`
+- Sprawdza dwie rzeczy, ktore moga byc zepsute przy zywym procesie uvicorna: baze
+  (`SELECT 1`) i wolne miejsce w `data_dir` (prog `MIN_FREE_DISK_MB = 500`)
+- Odpyt bazy ma **wlasny** timeout 3 s, krotszy niz `timeout: 10s` healthchecku —
+  SQLite w jednym procesie potrafi sie zablokowac pod obciazeniem ffmpeg, a
+  healthcheck ma wtedy dostac czytelne `db: timeout`, nie zostac urwany przez dockera
+- Zwraca **503**, nie 200 z polem `"unhealthy"`: healthcheck w compose patrzy tylko na
+  to, czy `urlopen()` rzucil. Cialo odpowiedzi niesie oba pomiary, zeby diagnoza nie
+  wymagala wchodzenia na serwer
+- Zarejestrowany **przed** mountem `StaticFiles` — `Mount("/")` przechwycilby `/health`
+  i zwrocil 404 statycznego pliku, bez zadnego bledu przy starcie
+- Docker sam nie restartuje kontenera `unhealthy` (robi to tylko swarm), wiec falszywy
+  alarm nie kladzie aplikacji — to obniza koszt sprawdzania wiecej niz mniej
+
+### `SEMAPHORE_LIMIT` z env
+- `settings.semaphore_limit` bylo zaszyte na 4. Na 1 vCPU to 4 rownolegle lancuchy
+  scen, czyli 4 procesy ffmpeg naraz — prosta droga do OOM. Produkcyjne `.env` ustawia 1
+
+### Odchudzony obraz
+- `langgraph` i `langgraph-checkpoint-sqlite` usuniete z `requirements.txt` — **nic ich
+  nie importowalo** (pipeline nigdy nie byl na LangGraph, mimo nazwy `app/graph/`).
+  Ciagnely za soba `langchain-core`, `orjson`, `msgpack`. `pip install` jest
+  najbardziej pamieciozernym momentem calego deployu i na 1 GB bez swapu potrafi
+  zostac ubity w polowie, wiec to czesc wdrozenia, a nie porzadki obok
+
+### Backup i dokumentacja
+- `scripts/backup-db.sh` — `sqlite3.backup()` zamiast `cp` (baza jest otwarta przez
+  dzialajacy kontener, zwykla kopia moze zlapac plik w polowie transakcji), rotacja
+  7 dni, do crona
+- `docs/deployment.md` — instrukcja krok po kroku, w tym plan B (`docker save | ssh
+  docker load`), gdy build nie miesci sie w pamieci VPS-a
+- `.env.prod.example` — szablon env na serwer
+
+### Znane ryzyko wdrozenia
+- **Czyszczenie plikow dalej nie istnieje** (Faza 1.3). 10 GB dysku dzielone z systemem
+  przy braku cleanupu to kwestia tygodni. `docs/deployment.md` §8 opisuje reczne
+  sprzatanie, `/health` ostrzega przed przekroczeniem progu
+- Brak systemu kredytow i limitu jobow na uzytkownika (Faza 3, 1.3): kazdy zalogowany
+  wydaje pieniadze wlasciciela instancji
+
 ## [0.4.0] — 2026-08-29 — Obsluga bledow i retry (roadmap Faza 1.2)
 
 Po 0.3.0 job przezywal restart kontenera, ale **jedna nieudana scena dalej kladla cala

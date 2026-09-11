@@ -59,6 +59,10 @@ CREATE INDEX IF NOT EXISTS idx_scenes_job_idx ON scenes(job_id, idx);
 # existing DB and abort the whole executescript, taking the CREATE TABLEs with it.
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_jobs_user_created ON jobs(user_id, created_at DESC);
+
+-- Sweep retencji pyta "joby starsze niz X, jeszcze nie sprzatane". Bez indeksu
+-- to full scan po calej tabeli co dobe -- tanio dzis, ale rosnie w nieskonczonosc.
+CREATE INDEX IF NOT EXISTS idx_jobs_purge ON jobs(workdirs_purged_at, created_at);
 """
 
 
@@ -87,6 +91,14 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             "UPDATE jobs SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             "WHERE created_at IS NULL"
         )
+
+    if "workdirs_purged_at" not in cols:
+        # Kiedy retencja skasowala material roboczy joba (uploads/frames/clips).
+        # NULL = jeszcze nie sprzatany, co dla starych wierszy jest prawda.
+        # Nie da sie tego wywnioskowac z dysku: brak katalogu znaczy tez "job
+        # nigdy nie mial plikow" albo "wolumin sie nie zamontowal", a te trzy
+        # przypadki wymagaja innej odpowiedzi na probe wznowienia.
+        await db.execute("ALTER TABLE jobs ADD COLUMN workdirs_purged_at TEXT")
 
     scene_cols = await _column_names(db, "scenes")
 

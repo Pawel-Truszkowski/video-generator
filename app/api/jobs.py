@@ -21,16 +21,28 @@ from app.graph.pipeline import (
     run_generation,
     run_planning,
 )
-from app.services import job_state
+from app.services import cleanup, job_state
+from app.services.job_state import STALE_STATUSES
 
 # Every route here requires a session by construction, so a future route added to
 # this router cannot accidentally be left public. Ownership of a specific job is
 # a separate check — see Depends(get_owned_job).
 router = APIRouter(dependencies=[Depends(require_user)])
 
-# Ids of jobs with a live asyncio task. Losing this on restart is correct
-# rather than a bug: after a restart nothing is running.
-_running: set[str] = set()
+# Jobs with a live asyncio task, job_id -> user_id. Losing this on restart is
+# correct rather than a bug: after a restart nothing is running. A dict, not a
+# set, because the values also answer "how many of this user's jobs are running?"
+# — see _assert_slot_free().
+_running: dict[str, str] = {}
+
+
+def is_job_running(job_id: str) -> bool:
+    """Read-only view of `_running` for the retention sweep.
+
+    The sweep must never delete files out from under a live task; it cannot
+    import `_running` itself without a cycle, so main.py passes this in.
+    """
+    return job_id in _running
 
 THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -45,7 +57,24 @@ BLOCKED_EDIT_STATUSES = ("generating", "stitching", "done")
 RETRYABLE_JOB_STATUSES = ("error", "interrupted")
 
 
-def _start(job_id: str, coro) -> None:
+def _assert_slot_free(user_id: str | None) -> None:
+    """Refuse to start a task when this user already has too many running.
+
+    Counted from `_running` rather than a `SELECT COUNT(*)` over the active
+    statuses: the dict is read and written synchronously, so two concurrent
+    requests cannot interleave between this check and the insert in _start().
+    A DB query here would `await`, opening exactly that window.
+    """
+    count = sum(1 for u in _running.values() if u == user_id)
+    if count >= settings.max_active_jobs_per_user:
+        raise HTTPException(
+            409,
+            f"Limit {settings.max_active_jobs_per_user} aktywnych jobów na użytkownika "
+            "przekroczony — poczekaj na zakończenie któregoś z nich",
+        )
+
+
+def _start(job_id: str, user_id: str | None, coro) -> None:
     """Run a pipeline coroutine in the background, once per job.
 
     Closes the rejected coroutine: an un-awaited one leaks and warns at GC time.
@@ -54,13 +83,22 @@ def _start(job_id: str, coro) -> None:
         coro.close()
         raise HTTPException(409, "Ten job już się wykonuje")
 
-    _running.add(job_id)
+    # The single gate every task passes through (plan / generate / resume /
+    # retry), so a route added later is covered by the limit for free — the same
+    # reason the duplicate-start check lives here rather than in each endpoint.
+    try:
+        _assert_slot_free(user_id)
+    except HTTPException:
+        coro.close()
+        raise
+
+    _running[job_id] = user_id
 
     async def _runner():
         try:
             await coro
         finally:
-            _running.discard(job_id)
+            _running.pop(job_id, None)
 
     asyncio.create_task(_runner())
 
@@ -73,6 +111,22 @@ def _assert_plan_editable(job: aiosqlite.Row, scenes: list[dict]) -> None:
     if any(s.get("status") == "done" for s in scenes):
         raise HTTPException(
             409, "Część scen jest już wygenerowana — edycja skasowałaby gotowe klipy"
+        )
+
+
+def _assert_files_present(job: aiosqlite.Row) -> None:
+    """Refuse anything that needs the job's source images back.
+
+    Without this the retention sweep turns 'Wznow' on an old job into a delayed
+    trap: _decide_stage() would answer 'generating', the task would start, and
+    generate_clips would die on an empty image_paths — surfacing as a bare
+    'error' status with no hint that the files are simply gone.
+    """
+    if job["workdirs_purged_at"]:
+        raise HTTPException(
+            409,
+            "Pliki źródłowe tego joba zostały usunięte przy sprzątaniu "
+            f"(po {settings.retention_days} dniach). Wgraj zdjęcia ponownie.",
         )
 
 
@@ -125,6 +179,7 @@ async def list_jobs(
     db = await get_db()
     rows = await db.execute(
         "SELECT j.id, j.status, j.prompt, j.model, j.est_cost_usd, j.created_at, j.error, "
+        "       j.workdirs_purged_at, "
         "       COUNT(s.id) AS scene_count, "
         "       COALESCE(SUM(s.duration_s), 0) AS total_duration_s "
         "  FROM jobs j "
@@ -140,6 +195,8 @@ async def list_jobs(
     for row in await rows.fetchall():
         job = dict(row)
         job["thumb_url"] = f"/jobs/{row['id']}/thumbnail"
+        # Lets the UI hide "Wznow" instead of offering a button that only 409s.
+        job["files_purged"] = bool(row["workdirs_purged_at"])
         # stat per row (cheap at limit<=200) so the UI never renders a download
         # button for a job whose mp4 has been cleaned off disk.
         final_path = os.path.join(settings.data_dir, "final", f"{row['id']}.mp4")
@@ -158,13 +215,15 @@ async def plan_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     if job["status"] not in ("uploaded", "error", "interrupted"):
         raise HTTPException(400, f"Job is already in status: {job['status']}")
 
+    _assert_files_present(job)
+
     state = await job_state.load_state(job_id)
     if state is None:
         raise HTTPException(404, "Job not found")
     if not state["image_paths"]:
         raise HTTPException(400, "Brak zdjęć dla tego joba")
 
-    _start(job_id, run_planning(job_id, state))
+    _start(job_id, job["user_id"], run_planning(job_id, state))
 
     return {"status": "planning"}
 
@@ -174,11 +233,13 @@ async def generate_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job))
     if job["status"] != "planned":
         raise HTTPException(400, f"Job must be in 'planned' status, got: {job['status']}")
 
+    _assert_files_present(job)
+
     state = await job_state.load_state(job_id)
     if state is None or not state["scenes"]:
         raise HTTPException(400, "Brak planu dla tego joba")
 
-    _start(job_id, run_generation(job_id, state))
+    _start(job_id, job["user_id"], run_generation(job_id, state))
 
     return {"status": "generating"}
 
@@ -281,8 +342,33 @@ async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
         "est_cost_usd": job["est_cost_usd"],
         "created_at": job["created_at"],
         "error": job["error"],
+        "files_purged": bool(job["workdirs_purged_at"]),
         "scenes": scenes,
     }
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
+    """Remove a job and every file it owns, final film included.
+
+    Ownership comes from get_owned_job, so someone else's id is a 404, not a 403.
+
+    Order matters: rows first, files second. Both orders have a failure mode if
+    the process dies mid-way, but they are not equally bad — leftover files are
+    invisible and get collected by cleanup's orphan sweep, whereas a leftover row
+    is visible in "Moje filmy" and hands the user buttons that can only fail.
+    """
+    if job_id in _running or job["status"] in STALE_STATUSES:
+        raise HTTPException(409, "Nie można usunąć joba w trakcie pracy")
+
+    db = await get_db()
+    await db.execute("DELETE FROM scenes WHERE job_id = ?", (job_id,))
+    await db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    await db.commit()
+
+    removed = cleanup.purge_all(job_id)
+
+    return {"deleted": job_id, "removed_paths": removed}
 
 
 @router.get("/jobs/{job_id}/thumbnail")
@@ -364,9 +450,13 @@ async def retry_scene(job_id: str, idx: int, job: aiosqlite.Row = Depends(get_ow
 
     # Checked before the reset, not by letting _start() raise: refusing after
     # the wipe would leave the scene cleared with nothing running to refill it.
+    # Same reason for the slot check — _start() repeats it, and that copy is the
+    # authoritative one, but by then the clip file is already gone.
     if job_id in _running:
         raise HTTPException(409, "Ten job już się wykonuje")
 
+    _assert_slot_free(job["user_id"])
+    _assert_files_present(job)
     _assert_scene_retryable(job, state["scenes"][idx])
 
     await job_state.reset_scene(job_id, idx)
@@ -378,7 +468,7 @@ async def retry_scene(job_id: str, idx: int, job: aiosqlite.Row = Depends(get_ow
             os.remove(path)
 
     state = await job_state.load_state(job_id)
-    _start(job_id, run_generation(job_id, state))
+    _start(job_id, job["user_id"], run_generation(job_id, state))
 
     return {"status": "generating", "idx": idx}
 
@@ -413,6 +503,8 @@ async def resume_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     if job_id in _running:
         raise HTTPException(409, "Ten job już się wykonuje")
 
+    _assert_files_present(job)
+
     state = await job_state.load_state(job_id)
     if state is None:
         raise HTTPException(404, "Job not found")
@@ -421,9 +513,9 @@ async def resume_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
 
     if stage == "planning":
         await _set_status(job_id, "uploaded")
-        _start(job_id, run_planning(job_id, state))
+        _start(job_id, job["user_id"], run_planning(job_id, state))
     elif stage == "generating":
-        _start(job_id, run_generation(job_id, state))
+        _start(job_id, job["user_id"], run_generation(job_id, state))
     # "planned"/"done" need no task — the frontend just opens the right screen.
 
     return {"stage": stage}
