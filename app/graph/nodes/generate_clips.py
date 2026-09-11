@@ -5,6 +5,7 @@ import os
 from typing import Awaitable, Callable
 
 from app.config import settings
+from app.providers.base import ProviderError
 from app.providers.mock_provider import MockProvider
 from app.providers.fal_provider import FalProvider
 from app.services.ffmpeg import extract_last_frame
@@ -115,15 +116,21 @@ async def generate_clips(
                 except Exception as e:
                     # TimeoutError stringifies to '', so naming it is the only
                     # way the message says anything at all.
-                    reason = (
-                        f"przekroczono limit {timeout:g}s"
-                        if isinstance(e, asyncio.TimeoutError)
-                        else f"{type(e).__name__}: {e}"
-                    )
-                    if attempt == settings.clip_max_retries:
+                    if isinstance(e, asyncio.TimeoutError):
+                        reason = f"przekroczono limit {timeout:g}s"
+                    elif isinstance(e, ProviderError):
+                        # Already user-facing; the class name would only be noise.
+                        reason = str(e)
+                    else:
+                        reason = f"{type(e).__name__}: {e}"
+                    # A rejected input fails identically every time, so the
+                    # remaining attempts would only add minutes of waiting.
+                    give_up = isinstance(e, ProviderError) and not e.retryable
+                    if give_up or attempt == settings.clip_max_retries:
+                        tries = "próbie" if attempt == 0 else "próbach"
                         msg = (
                             f"Scena {idx + 1} nie powiodła się po "
-                            f"{settings.clip_max_retries + 1} próbach: {reason}"
+                            f"{attempt + 1} {tries}: {reason}"
                         )
                         scene["status"] = "error"
                         if on_scene_error:
