@@ -347,18 +347,19 @@ async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     }
 
 
-@router.delete("/jobs/{job_id}")
-async def delete_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
-    """Remove a job and every file it owns, final film included.
+async def remove_job(job_id: str, status: str) -> int:
+    """Delete a job's rows, then every file it owns, final film included.
 
-    Ownership comes from get_owned_job, so someone else's id is a 404, not a 403.
+    Shared by DELETE /jobs/{id} and DELETE /admin/jobs/{id}, so the busy check
+    and the ordering below exist once. Callers resolve the job first; this does
+    no ownership check of its own.
 
     Order matters: rows first, files second. Both orders have a failure mode if
     the process dies mid-way, but they are not equally bad — leftover files are
     invisible and get collected by cleanup's orphan sweep, whereas a leftover row
     is visible in "Moje filmy" and hands the user buttons that can only fail.
     """
-    if job_id in _running or job["status"] in STALE_STATUSES:
+    if job_id in _running or status in STALE_STATUSES:
         raise HTTPException(409, "Nie można usunąć joba w trakcie pracy")
 
     db = await get_db()
@@ -366,8 +367,16 @@ async def delete_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     await db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     await db.commit()
 
-    removed = cleanup.purge_all(job_id)
+    return cleanup.purge_all(job_id)
 
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
+    """Remove one of the caller's own jobs.
+
+    Ownership comes from get_owned_job, so someone else's id is a 404, not a 403.
+    """
+    removed = await remove_job(job_id, job["status"])
     return {"deleted": job_id, "removed_paths": removed}
 
 

@@ -109,7 +109,13 @@ async def auth_callback(token: str = Query(...)) -> RedirectResponse:
 
 @router.get("/me")
 async def me(user: aiosqlite.Row = Depends(require_user)) -> dict:
-    return {"email": user["email"], "created_at": user["created_at"]}
+    # is_admin only decides whether app.js shows the "Admin" button; the /admin
+    # routes check it again server-side.
+    return {
+        "email": user["email"],
+        "created_at": user["created_at"],
+        "is_admin": bool(user["is_admin"]),
+    }
 
 
 @router.post("/logout")

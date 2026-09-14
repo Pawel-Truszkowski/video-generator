@@ -30,14 +30,39 @@ async def get_or_create_user(email: str) -> aiosqlite.Row:
         return user
 
     user_id = uuid.uuid4().hex[:12]
+    # sync_admins() only sees accounts that existed when the process started, so
+    # an ADMIN_EMAILS address signing up afterwards gets the flag here instead.
+    is_admin = int(email in settings.admin_emails)
     await db.execute(
-        f"INSERT INTO users (id, email, created_at) VALUES (?, ?, {NOW})",
-        (user_id, email),
+        f"INSERT INTO users (id, email, created_at, is_admin) VALUES (?, ?, {NOW}, ?)",
+        (user_id, email, is_admin),
     )
     await db.commit()
 
     cur = await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     return await cur.fetchone()
+
+
+async def sync_admins(emails: frozenset[str]) -> None:
+    """Apply ADMIN_EMAILS to users.is_admin. Called once per start, in lifespan.
+
+    `emails` are already lowercase (config.py); users.email is stored lowercase
+    too and is COLLATE NOCASE, so a plain `email IN (...)` matches.
+
+    Reached only for accounts that already exist -- an address that signs up
+    later is handled in get_or_create_user.
+    """
+    db = await get_db()
+    placeholders = ", ".join("?" * len(emails))
+    params = tuple(emails)
+
+    await db.execute(
+        f"UPDATE users SET is_admin = 1 WHERE email IN ({placeholders})", params
+    )
+    await db.execute(
+        f"UPDATE users SET is_admin = 0 WHERE email NOT IN ({placeholders})", params
+    )
+    await db.commit()
 
 
 async def create_magic_token(user_id: str, raw_token: str) -> None:

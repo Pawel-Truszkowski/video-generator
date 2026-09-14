@@ -34,6 +34,39 @@ Zaleznosci: brak
 - [x] Wyciek kolejek SSE — `release_event_queue()` wolane w `finally` generatora
       w `job_events`, klucz `job_id` znika po ostatnim subskrybencie, kolejka ma
       `maxsize=100`, a `_emit()` wyrejestrowuje kolejke, ktorej nikt nie opróznia.
+- [x] Czytelne bledy providera — `ProviderError(message, retryable)` w
+      `providers/base.py`, `_translate_fal_error()` w `fal_provider.py`. Bez tego
+      422 z fal.ai wklejal caly request (z obrazem base64) do `scenes.error`, logow
+      i UI. `content_policy_violation` i inne bledy walidacji nie sa ponawiane —
+      identyczny request pada identycznie.
+- [ ] Scena w lancuchu odrzucona przez filtr tresci na `image_url` (tj. na klatce
+      z poprzedniego klipu, nie na uploadzie) — automatycznie sprobowac raz z
+      oryginalnym obrazem sceny (`image_index`). Decyzja produktowa: traci sie
+      ciaglosc ruchu. Przypadek z produkcji: job `de845d484e04` (artroskopia).
+
+### 1.4 Znaleziska z code review (11.09.2026) — DO ZROBIENIA
+Niezweryfikowane recznie — przed poprawka najpierw odtworzyc.
+- [ ] **Wysoki:** `POST /jobs/{id}/plan` przyjmuje joby `error`/`interrupted`, ale
+      nie sprawdza scen `done` (`app/api/jobs.py`, ~l. 215). `save_scenes` to
+      DELETE+INSERT, wiec oplacone klipy wracaja do `pending` i fal.ai placi sie
+      drugi raz. Edycja planu ma te blokade (`_assert_plan_editable`), replan nie —
+      lamie regule 7 z CLAUDE.md
+- [ ] **Wysoki:** `_decide_stage` (~l. 497) zwraca `generating` dla joba
+      przerwanego w trakcie ponownego planowania, ktory ma jeszcze STARE wiersze
+      scen (`save_scenes` wykonuje sie dopiero po udanym planowaniu). "Wznow"
+      generuje wtedy nieaktualny plan bez nacisniecia "Generuj". Poprawka razem z
+      punktem wyzej
+- [ ] **Sredni:** "Ponow" na jednej scenie generuje tez inne sceny w `error`
+      (~l. 462) — `reset_scene` czysci tylko `idx`, a `run_generation` bierze
+      wszystko, co nie jest `done`. Placi sie za sceny, ktorych uzytkownik nie
+      wybral, a scena odrzucona przez filtr tresci znow wywraca joba na `error`
+- [ ] **Sredni:** timeout moze uszkodzic klip (`fal_provider.py`, `.part`).
+      `wait_for` anuluje coroutine, nie watek `urlretrieve`; retry pisze do tego
+      samego `{out_path}.part`, dwa watki trafiaja w jeden inode, a wynik ma status
+      `done`. Poprawka: unikalna nazwa tymczasowa na probe (`{out_path}.{uuid}.part`)
+- [ ] **Niski:** `/resume` (~l. 515) ustawia `uploaded` i czysci `error` PRZED
+      sprawdzeniem limitu jobow — po 409 job traci komunikat bledu. Najpierw
+      `_assert_slot_free`, jak w `retry_scene`
 
 ### 1.3 Czyszczenie danych — ZROBIONE (0.5.0)
 - [x] Task kasujacy pliki (clips, uploads, frames) starsze niz `RETENTION_DAYS` (7)

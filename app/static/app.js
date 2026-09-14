@@ -58,14 +58,23 @@
   const jobsEmpty = document.getElementById('jobs-empty');
   const btnJobsNew = document.getElementById('btn-jobs-new');
 
+  // Admin panel (Faza 2.3)
+  const btnAdmin = document.getElementById('btn-admin');
+  const adminJobs = document.getElementById('admin-jobs');
+  const adminJobsEmpty = document.getElementById('admin-jobs-empty');
+  const adminUsers = document.getElementById('admin-users');
+  const adminStatusFilter = document.getElementById('admin-status-filter');
+
   // Screens are mutually exclusive; showScreen is the only thing that toggles them.
-  const SCREEN_IDS = ['screen-login', 'screen-form', 'screen-plan', 'screen-progress', 'screen-jobs'];
+  const SCREEN_IDS = ['screen-login', 'screen-form', 'screen-plan', 'screen-progress', 'screen-jobs', 'screen-admin'];
 
   function showScreen(id) {
     SCREEN_IDS.forEach(s => {
       document.getElementById(s).classList.toggle('hidden', s !== id);
     });
     userBar.classList.toggle('hidden', !currentUser);
+    // Cosmetic only: every /admin route checks is_admin server-side.
+    btnAdmin.classList.toggle('hidden', !(currentUser && currentUser.is_admin));
   }
 
   // Every authenticated call goes through this so a 401 can never fail silently.
@@ -884,6 +893,185 @@
   });
   btnJobsNew.addEventListener('click', () => showScreen('screen-form'));
   btnNewVideo.addEventListener('click', () => showScreen('screen-form'));
+
+  // ------------------------------------------------------------- Admin ----
+
+  function fmtDate(iso) {
+    // Correct only because the API returns ISO-8601 with a trailing Z.
+    return iso ? new Date(iso).toLocaleString('pl-PL') : '-';
+  }
+
+  /** Append a <td>; `content` is a Node or plain text (never HTML). */
+  function cell(tr, content, className) {
+    const td = document.createElement('td');
+    if (content instanceof Node) td.appendChild(content);
+    else td.textContent = content == null ? '' : String(content);
+    if (className) td.className = className;
+    tr.appendChild(td);
+    return td;
+  }
+
+  function headerRow(table, labels) {
+    const tr = document.createElement('tr');
+    labels.forEach(l => {
+      const th = document.createElement('th');
+      th.textContent = l;
+      tr.appendChild(th);
+    });
+    table.appendChild(tr);
+  }
+
+  async function adminGet(url) {
+    const res = await apiFetch(url);
+    if (!res.ok) throw new Error(await errText(res));
+    return res.json();
+  }
+
+  async function loadAdminJobs() {
+    adminJobs.innerHTML = '';
+    adminJobsEmpty.classList.add('hidden');
+    const status = adminStatusFilter.value;
+    let data;
+    try {
+      data = await adminGet('/admin/jobs' + (status ? `?status=${encodeURIComponent(status)}` : ''));
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      return;
+    }
+    if (!data.jobs.length) {
+      adminJobsEmpty.classList.remove('hidden');
+      return;
+    }
+    headerRow(adminJobs, ['Data', 'Uzytkownik', 'Status', 'Opis', 'Model', 'Koszt', 'Sceny', 'Blad', '']);
+    data.jobs.forEach(job => adminJobs.appendChild(renderAdminJobRow(job)));
+  }
+
+  function renderAdminJobRow(job) {
+    const tr = document.createElement('tr');
+    cell(tr, fmtDate(job.created_at), 'nowrap');
+    // user_id NULL = a job from before accounts existed (pre-0.2.0).
+    cell(tr, job.user_email || '(bez konta)');
+
+    const badge = document.createElement('span');
+    badge.className = 'status-badge ' + statusClass(job.status);
+    badge.textContent = STATUS_LABELS[job.status] || job.status;
+    cell(tr, badge);
+
+    cell(tr, job.prompt, 'clip').title = job.prompt || '';
+    cell(tr, job.model);
+    cell(tr, job.est_cost_usd != null ? '$' + Number(job.est_cost_usd).toFixed(2) : '-', 'nowrap');
+    cell(tr, job.scene_count ? `${job.scene_count} / ${fmtDuration(job.total_duration_s || 0)}` : '-', 'nowrap');
+    cell(tr, job.error || '', 'clip error-text').title = job.error || '';
+
+    const actions = cell(tr, '');
+    // Same rule as "Moje filmy": a live task owns these files, DELETE would 409.
+    if (!BUSY_STATUSES.includes(job.status)) {
+      const del = document.createElement('button');
+      del.className = 'btn-link danger';
+      del.textContent = 'Usun';
+      del.onclick = () => adminDeleteJob(job, tr);
+      actions.appendChild(del);
+    }
+    return tr;
+  }
+
+  async function adminDeleteJob(job, tr) {
+    const owner = job.user_email || 'bez konta';
+    if (!confirm(`Usunac job ${job.id} (${owner}) wraz z gotowym filmem? Tej operacji nie da sie cofnac.`)) return;
+    try {
+      const res = await apiFetch(`/admin/jobs/${job.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await errText(res));
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      return;
+    }
+    tr.remove();
+    if (jobId === job.id) jobId = null;
+    // Only the header row left.
+    if (adminJobs.rows.length <= 1) {
+      adminJobs.innerHTML = '';
+      adminJobsEmpty.classList.remove('hidden');
+    }
+    // The job count and cost per user just changed.
+    loadAdminUsers();
+  }
+
+  async function loadAdminUsers() {
+    adminUsers.innerHTML = '';
+    let data;
+    try {
+      data = await adminGet('/admin/users');
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      return;
+    }
+    headerRow(adminUsers, ['Email', 'Rejestracja', 'Ostatnie logowanie', 'Joby', 'Koszt (szac.)', 'Konto', '']);
+    data.users.forEach(u => adminUsers.appendChild(renderAdminUserRow(u)));
+  }
+
+  function renderAdminUserRow(u) {
+    const tr = document.createElement('tr');
+    const email = cell(tr, u.email);
+    if (u.is_admin) {
+      const tag = document.createElement('span');
+      tag.className = 'admin-tag';
+      tag.textContent = 'admin';
+      email.appendChild(tag);
+    }
+    cell(tr, fmtDate(u.created_at), 'nowrap');
+    cell(tr, fmtDate(u.last_login_at), 'nowrap');
+    cell(tr, u.job_count);
+    cell(tr, '$' + Number(u.est_cost_usd || 0).toFixed(2), 'nowrap');
+
+    const state = document.createElement('span');
+    state.className = 'status-badge ' + (u.is_active ? 'done' : 'error');
+    state.textContent = u.is_active ? 'Aktywne' : 'Zablokowane';
+    cell(tr, state);
+
+    const actions = cell(tr, '');
+    // /auth/me carries no id, so "is this me" goes by email. The server
+    // refuses self-blocking with a 409 either way.
+    if (u.email !== currentUser.email) {
+      const btn = document.createElement('button');
+      btn.className = 'btn-link' + (u.is_active ? ' danger' : '');
+      btn.textContent = u.is_active ? 'Zablokuj' : 'Odblokuj';
+      btn.onclick = () => adminSetActive(u, !u.is_active, btn);
+      actions.appendChild(btn);
+    }
+    return tr;
+  }
+
+  async function adminSetActive(u, active, btn) {
+    if (!active && !confirm(`Zablokowac ${u.email}? Konto zostanie wylogowane przy nastepnym zapytaniu; trwajace joby sie dokoncza.`)) return;
+    btn.disabled = true;
+    try {
+      const res = await apiFetch(`/admin/users/${u.id}/active`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: active }),
+      });
+      if (!res.ok) throw new Error(await errText(res));
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      btn.disabled = false;
+      return;
+    }
+    loadAdminUsers();
+  }
+
+  Object.entries(STATUS_LABELS).forEach(([value, label]) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    adminStatusFilter.appendChild(opt);
+  });
+  adminStatusFilter.addEventListener('change', loadAdminJobs);
+
+  btnAdmin.addEventListener('click', () => {
+    showScreen('screen-admin');
+    loadAdminJobs();
+    loadAdminUsers();
+  });
 
   // ---------------------------------------------------------------- Boot ----
 
