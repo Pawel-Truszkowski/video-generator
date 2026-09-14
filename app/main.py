@@ -11,8 +11,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import get_db, close_db
+from app.api.admin import router as admin_router
 from app.api.auth import router as auth_router
 from app.api.jobs import is_job_running, router as jobs_router
+from app.auth.store import sync_admins
 from app.config import settings
 from app.services import cleanup
 from app.services.job_state import reconcile_interrupted
@@ -41,6 +43,8 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.data_dir, exist_ok=True)
     _check_config()
     await get_db()
+    # After get_db(): _migrate() is what adds users.is_admin on an existing DB.
+    await sync_admins(settings.admin_emails)
     # planning/generating/stitching belonged to the process that just died;
     # nothing will push those jobs forward, so flag them as resumable.
     stale = await reconcile_interrupted()
@@ -73,6 +77,7 @@ app = FastAPI(title="Video Generator POC", lifespan=lifespan)
 
 app.include_router(auth_router)
 app.include_router(jobs_router)
+app.include_router(admin_router)
 
 
 @app.get("/health")

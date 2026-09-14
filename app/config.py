@@ -20,6 +20,12 @@ class Settings:
     base_url: str = field(default_factory=lambda: os.getenv("BASE_URL", "http://localhost:8000"))
     session_secret: str = field(default_factory=lambda: os.getenv("SESSION_SECRET", ""))
     cookie_secure: bool = field(default_factory=lambda: os.getenv("COOKIE_SECURE", "false").lower() in ("true", "1", "yes"))
+    # Panel admina (Faza 2.3). Lowercase, bo tak zapisuje users.email
+    # normalize_email() -- porownanie w Pythonie (get_or_create_user) nie zna
+    # COLLATE NOCASE z bazy.
+    admin_emails: frozenset[str] = field(default_factory=lambda: frozenset(
+        e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()
+    ))
 
     session_cookie_name: str = "vg_session"
     session_ttl_days: int = 30
