@@ -110,11 +110,26 @@ Zaleznosci: brak
 - [x] Strona "Moje filmy" — lista z miniaturkami, statusem, data
       (tylko do odczytu — wznawianie niedokonczonych jobow wymaga Fazy 1.1)
 
-### 2.3 Prosty panel admina
-- [ ] Endpoint `GET /admin/jobs` — lista wszystkich jobow (tylko admin)
-- [ ] Podglad statusu, kosztu, uzytkownika
-- [ ] Mozliwosc recznego usuwania jobow
-- [ ] Rola admina w tabeli users (`is_admin`)
+### 2.3 Prosty panel admina — ZROBIONE (0.6.0)
+- [x] Endpoint `GET /admin/jobs` — joby wszystkich uzytkownikow, filtr po statusie,
+      `LIMIT`/`OFFSET`. `LEFT JOIN users`, nie `JOIN`: joby sprzed 0.2.0 maja
+      `user_id = NULL` i poza panelem nie widzi ich nikt
+- [x] Podglad statusu, kosztu (szacunkowego), uzytkownika, liczby scen i bledu
+- [x] Reczne usuwanie jobow — `DELETE /admin/jobs/{id}` przez wspolny
+      `remove_job()` w `jobs.py`. Druga kopia tej logiki w `admin.py` rozjechalaby
+      sie z regula „baza przed dyskiem" i z blokada 409 na jobie w trakcie pracy
+- [x] Rola admina w `users.is_admin` (migracja w `_migrate()`) + `require_admin`.
+      **403, nie 404** jak `get_owned_job`: id joba warto ukrywac, istnienia
+      `/admin` nie — `app.js` i tak wysyla przycisk, ktory tam uderza
+- [x] Zrodlem roli jest `ADMIN_EMAILS` z env, nie reczny UPDATE. `sync_admins()`
+      przy starcie nadaje **i odbiera** flage (idempotentne — wynik zalezy tylko od
+      env, nie od historii bazy); adres, ktory zarejestruje sie pozniej, dostaje
+      flage w `get_or_create_user`
+- [x] `GET /admin/users` + `POST /admin/users/{id}/active` — blokowanie kont.
+      Kill-switch `is_active` istnial od 0.2.0, brakowalo mu tylko przycisku
+- [ ] Audyt akcji admina — na razie `print()` do logow kontenera, bez tabeli
+- [ ] Reczne wznowienie cudzego joba — wymaga decyzji, czyj slot w `_running`
+      zajmuje admin (limit liczy sie per `user_id`)
 
 ---
 
