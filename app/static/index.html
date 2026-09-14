@@ -13,6 +13,7 @@
       <span class="topbar-nav">
         <button class="btn-link" id="btn-new-video">Nowy film</button>
         <button class="btn-link" id="btn-my-videos">Moje filmy</button>
+        <button class="btn-link hidden" id="btn-admin">Admin</button>
         <button class="btn-link" id="btn-logout">Wyloguj</button>
       </span>
     </div>
@@ -121,6 +122,27 @@
       <div id="jobs-empty" class="empty-state hidden">Nie masz jeszcze zadnych filmow.</div>
       <div class="actions">
         <button class="btn-primary" id="btn-jobs-new">Nowy film</button>
+      </div>
+    </div>
+
+    <!-- SCREEN 5: Admin panel (Faza 2.3) -->
+    <div id="screen-admin" class="hidden">
+      <h2>Panel admina</h2>
+
+      <div class="admin-section">
+        <div class="admin-head">
+          <h3>Joby</h3>
+          <select id="admin-status-filter">
+            <option value="">Wszystkie statusy</option>
+          </select>
+        </div>
+        <div class="table-wrap"><table class="admin-table" id="admin-jobs"></table></div>
+        <div id="admin-jobs-empty" class="empty-state hidden">Brak jobow.</div>
+      </div>
+
+      <div class="admin-section">
+        <h3>Uzytkownicy</h3>
+        <div class="table-wrap"><table class="admin-table" id="admin-users"></table></div>
       </div>
     </div>
   </div>

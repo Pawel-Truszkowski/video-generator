@@ -130,6 +130,14 @@ async def _migrate(db: aiosqlite.Connection) -> None:
                     # Should never happen, but don't crash the whole migration if it does.
                     pass
 
+    user_cols = await _column_names(db, "users")
+
+    if "is_admin" not in user_cols:
+        # Stala wartosc domyslna, wiec bez backfillu: istniejace konta sa
+        # zwyklymi uzytkownikami, dopoki sync_admins() przy starcie nie
+        # przepisze na nie ADMIN_EMAILS.
+        await db.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+
     await db.commit()
 
 

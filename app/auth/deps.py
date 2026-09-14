@@ -56,7 +56,7 @@ async def get_current_user(request: Request) -> aiosqlite.Row | None:
     # account out everywhere immediately.
     db = await get_db()
     cur = await db.execute(
-        "SELECT id, email, created_at, is_active FROM users WHERE id = ? AND is_active = 1",
+        "SELECT id, email, created_at, is_active, is_admin FROM users WHERE id = ? AND is_active = 1",
         (user_id,),
     )
     return await cur.fetchone()
@@ -67,6 +67,23 @@ async def require_user(
 ) -> aiosqlite.Row:
     if user is None:
         raise HTTPException(status_code=401, detail="Nie jestes zalogowany")
+    return user
+
+
+async def require_admin(
+    user: aiosqlite.Row = Depends(require_user),
+) -> aiosqlite.Row:
+    """Gate for the /admin router.
+
+    is_admin comes from the row get_current_user re-reads on every request, so
+    taking someone off ADMIN_EMAILS (plus a restart) cuts them off at once, the
+    same kill-switch property as is_active.
+
+    403, not the 404 of get_owned_job: a job id is worth hiding, the existence
+    of /admin is not — app.js ships the button that calls it.
+    """
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Brak uprawnień administratora")
     return user
 
 

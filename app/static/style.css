@@ -161,3 +161,19 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .job-card video { width: 100%; margin-top: 8px; border-radius: 6px; }
 .status-badge.planned { background: #2d3748; color: #aaa; }
 .empty-state { color: #888; text-align: center; padding: 32px; }
+
+/* Admin panel (Faza 2.3) */
+.admin-section { margin-top: 24px; }
+.admin-section h3 { font-size: 1rem; margin-bottom: 8px; }
+.admin-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.admin-head select { width: auto; }
+.table-wrap { overflow-x: auto; }
+.admin-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.admin-table th { text-align: left; color: #888; font-weight: 600; padding: 6px 8px;
+  border-bottom: 1px solid #333; white-space: nowrap; }
+.admin-table td { padding: 6px 8px; border-bottom: 1px solid #23262b; vertical-align: middle; }
+.admin-table td.nowrap { white-space: nowrap; }
+.admin-table td.clip { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.admin-table td.error-text { color: #e74c3c; }
+.admin-tag { margin-left: 6px; font-size: 0.7rem; color: #e6a23c; border: 1px solid #e6a23c;
+  border-radius: 3px; padding: 0 4px; }

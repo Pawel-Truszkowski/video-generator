@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.6.0] — 2026-09-14 — Panel admina (roadmap Faza 2.3)
+
+Pierwszy widok na dane wszystkich uzytkownikow. Do tej pory jedyna droga do
+cudzego joba byla przez `sqlite3` na serwerze.
+
+### Rola admina — env, nie reczny UPDATE
+- `users.is_admin` (migracja w `_migrate()`; `CREATE TABLE IF NOT EXISTS` nie
+  dodalby kolumny do istniejacej bazy). Bez backfillu: stale wartosci domyslne
+  ALTER TABLE przyjmuje, wiec istniejace konta zaczynaja jako zwykli uzytkownicy
+- `ADMIN_EMAILS` (lista po przecinku) → `sync_admins()` w `lifespan`, po `get_db()`,
+  bo to `_migrate()` dodaje kolumne. Dwa UPDATE-y: nadaje flage adresom z listy i
+  **odbiera** wszystkim pozostalym. Dzieki temu funkcja jest idempotentna — wynik
+  zalezy wylacznie od env, nie od tego, co bylo w bazie. Wariant „tylko nadawaj"
+  zalezalby od historii i po kilku restartach z roznymi `.env` baza pamietalaby
+  ich sume
+- Konsekwencja swiadoma: **puste `ADMIN_EMAILS` zostawia baze bez adminow**
+  (SQLite dopuszcza `NOT IN ()` i pasuje ono do kazdego wiersza). Powrot to
+  `UPDATE users SET is_admin=1` w `sqlite3` na serwerze
+- Adres z listy, ktory zarejestruje sie **po** starcie, dostaje flage w
+  `get_or_create_user` — `sync_admins()` widzi tylko konta istniejace przy starcie
+- `get_current_user` czyta `is_admin` przy kazdym zadaniu, wiec usuniecie adresu z
+  `ADMIN_EMAILS` + restart odcina dostep natychmiast. Ta sama wlasnosc co `is_active`
+
+### `require_admin` — 403, nie 404
+- `app/auth/deps.py`. Reszta API ukrywa cudze zasoby pod 404 (`get_owned_job`),
+  zeby nie dalo sie zgadywac id jobow. Tu jest odwrotnie: `/admin` nie jest
+  tajemnica — `app.js` wysyla przycisk, ktory tam uderza — a 403 latwiej debugowac
+- Nowy router **nie dziedziczy** ochrony po `jobs`, stad
+  `APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])`. Router
+  wlaczony w `main.py` przed montowaniem `StaticFiles` na `/`, inaczej trasy
+  zwracalyby 404 od static files bez zadnego bledu przy starcie
+
+### Endpointy
+- `GET /admin/jobs` — filtr `status`, `LIMIT`/`OFFSET`, liczba scen i laczny czas.
+  `LEFT JOIN users`: joby sprzed 0.2.0 maja `user_id = NULL`, nie widzi ich zaden
+  uzytkownik w „Moje filmy" i to jedyne miejsce, gdzie da sie do nich dotrzec
+- `DELETE /admin/jobs/{id}` — ta sama sciezka co usuwanie wlasnego joba
+- `GET /admin/users` — konta z liczba jobow i suma kosztow. **Koszt jest
+  szacunkiem planera** (`est_cost_usd`), nie tym, co naliczyl fal.ai; realne wydatki
+  pojawia sie dopiero z ledgerem w Fazie 3
+- `POST /admin/users/{id}/active` — blokada/odblokowanie konta. Dziala od nastepnego
+  zadania zablokowanego uzytkownika, a stary magic link go nie wskrzesi
+  (`consume_magic_token` sprawdza `is_active = 1`). Joby juz uruchomione koncza sie
+  normalnie: blokada zatrzymuje nowe wydatki, nie wyrzuca oplaconej w polowie generacji
+- 409 na probe zablokowania **wlasnego** konta — zablokowany admin nie moze sie
+  zalogowac, zeby to cofnac, wiec z UI nie byloby powrotu
+
+### `remove_job()` wyciagniete z `delete_job`
+- `app/api/jobs.py`. Endpoint uzytkownika i endpoint admina roznia sie tylko tym,
+  jak znajduja joba; reszta — 409 gdy job jest w `_running` albo w statusie
+  aktywnym, kolejnosc „wiersz przed plikami", `cleanup.purge_all()` — istnieje raz
+- Funkcja zostaje w `jobs.py`, bo `_running` jest stanem modulowym tego pliku
+
+### Panel w UI
+- Szosty ekran (`screen-admin`) w tym samym `showScreen()`, dwie tabele: joby i
+  konta. Przycisk „Admin" ukrywany po `is_admin` z `GET /auth/me` — to sama
+  kosmetyka, kazda trasa `/admin` sprawdza role po stronie serwera
+
+### Czego tu nie ma
+- Audytu: kto skasowal czyj film widac tylko w `print()` w logach kontenera
+- Wznawiania cudzych jobow — limit `MAX_ACTIVE_JOBS_PER_USER` liczy sloty per
+  `user_id`, wiec admin wznawiajacy cudzy job zajmowalby slot tamtego uzytkownika
+
+### Przy okazji (commit `cb0bb67`, bez osobnej wersji)
+- `ProviderError(message, retryable)` w `providers/base.py` +
+  `_translate_fal_error()` w `fal_provider.py`: 422 z fal.ai wklejal wczesniej caly
+  request (z obrazem w base64) do `scenes.error`, logow i UI. Bledy walidacji, w tym
+  `content_policy_violation`, nie sa ponawiane — identyczny request padnie identycznie
+
 ## [0.5.0] — 2026-08-30 — Czyszczenie danych (roadmap Faza 1.3)
 
 Zamyka oba ryzyka wdrozeniowe wpisane w 0.4.1: brak czyszczenia plikow i brak
