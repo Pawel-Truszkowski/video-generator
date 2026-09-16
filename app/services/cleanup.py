@@ -1,11 +1,11 @@
-"""Retencja plikow i kasowanie jobow (roadmap Faza 1.3).
+"""File retention and job deletion (roadmap Faza 1.3).
 
-Jedyne miejsce w aplikacji, ktore usuwa pliki joba. Sciezki bierze wylacznie
-z `job_state` -- gdyby budowalo wlasne, rozjechalyby sie z tym, co pipeline
-naprawde zapisal, a skutkiem byloby ciche niesprzatanie polowy danych.
+The only place in the app that deletes a job's files. Every path comes from
+`job_state`; building paths here instead would drift from what the pipeline
+actually wrote, and half the data would quietly never be swept.
 
-`data/final` jest wylaczony z retencji i kasuje go tylko purge_all() (czyli
-DELETE /jobs/{id}): gotowy film jest produktem, za ktory ktos zaplacil.
+`data/final` is exempt from retention and only purge_all() (i.e. DELETE
+/jobs/{id}) removes it: the finished film is a product someone paid for.
 """
 
 from __future__ import annotations
@@ -27,16 +27,16 @@ from app.services.job_state import (
     uploads_dir,
 )
 
-# Katalogi trzymajace jeden podkatalog na job_id. `final` nie jest na liscie:
-# tam kazdy plik ma wlasciciela i nie wolno go skasowac po samym wieku.
+# Directories holding one subdirectory per job_id. `final` is absent on purpose:
+# every file there has an owner and must not be deleted on age alone.
 WORK_SUBDIRS = ("uploads", "frames", "clips", "stitch")
 
 
 def _rmtree(path: str) -> bool:
-    """Skasuj katalog. True, jesli cokolwiek zniknelo.
+    """Delete a directory. True if anything was removed.
 
-    Blad I/O nie moze przerwac calego sweepu: jeden zablokowany katalog
-    zostawilby nieposprzatana cala reszte, a nastepna proba jest za dobe.
+    An I/O error must not abort the whole sweep: one locked directory would leave
+    everything else unswept, and the next attempt is a day away.
     """
     if not os.path.isdir(path):
         return False
@@ -60,7 +60,7 @@ def _remove_file(path: str) -> bool:
 
 
 def purge_workdirs(job_id: str) -> int:
-    """Skasuj material roboczy joba. Zwraca liczbe usunietych katalogow."""
+    """Delete a job's working material. Returns how many directories went."""
     removed = 0
     for path in (uploads_dir(job_id), frames_dir(job_id), clips_dir(job_id),
                  stitch_dir(job_id)):
@@ -69,7 +69,7 @@ def purge_workdirs(job_id: str) -> int:
 
 
 def purge_all(job_id: str) -> int:
-    """purge_workdirs() + gotowy film."""
+    """purge_workdirs() plus the finished film."""
     return purge_workdirs(job_id) + _remove_file(final_path(job_id))
 
 
@@ -80,15 +80,14 @@ def _never_running(_job_id: str) -> bool:
 
 
 async def _purge_old_jobs(is_running: Callable[[str], bool]) -> int:
-    """Retencja jobow znanych bazie. Zwraca liczbe posprzatanych jobow."""
+    """Retention for jobs the DB knows about. Returns how many were swept."""
     db = await get_db()
     placeholders = ", ".join("?" * len(STALE_STATUSES))
     cur = await db.execute(
-        # Dwa filtry statusu, bo lataja rozne dziury. Kolumna `status` chroni po
-        # restarcie (job zostal 'generating' po martwym procesie -- ale to juz
-        # zdazyl przestawic reconcile_interrupted), `is_running` chroni w trakcie
-        # normalnej pracy, gdzie zywy task ma status aktywny i pisze do clips/.
-        # Skasowanie plikow spod dzialajacego taska dalo by polowe filmu bez bledu.
+        # Two status filters, patching different holes. The `status` column
+        # covers the post-restart case; `is_running` covers normal operation,
+        # where a live task holds an active status and is writing to clips/.
+        # Deleting files under a running task yields half a film and no error.
         f"SELECT id FROM jobs "
         f" WHERE workdirs_purged_at IS NULL "
         f"   AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now', ?) "
@@ -102,9 +101,9 @@ async def _purge_old_jobs(is_running: Callable[[str], bool]) -> int:
         if is_running(job_id):
             continue
         purge_workdirs(job_id)
-        # Znacznik leci nawet wtedy, gdy nie bylo czego kasowac: stan "material
-        # roboczy tego joba juz nie istnieje" jest prawdziwy tak samo, a bez
-        # zapisu sweep braleby ten sam job pod uwage co dobe, w nieskonczonosc.
+        # The marker is written even when nothing was deleted: "this job's
+        # working material no longer exists" is equally true, and without the
+        # write the sweep would reconsider the same job every day forever.
         await db.execute(
             "UPDATE jobs SET workdirs_purged_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             " WHERE id = ?",
@@ -118,7 +117,7 @@ async def _purge_old_jobs(is_running: Callable[[str], bool]) -> int:
 
 
 def _older_than(path: str, cutoff: float) -> bool:
-    """False takze wtedy, gdy nie da sie odczytac mtime -- nie kasuj po omacku."""
+    """False when mtime cannot be read either — never delete blind."""
     try:
         return os.path.getmtime(path) < cutoff
     except OSError:
@@ -126,15 +125,15 @@ def _older_than(path: str, cutoff: float) -> bool:
 
 
 async def _purge_orphans() -> int:
-    """Skasuj material roboczy, do ktorego nie przyznaje sie zaden job.
+    """Delete working material no job claims.
 
-    Luzny plik na szczycie tych katalogow jest sierota z definicji: obecny kod
-    zawsze pisze do podkatalogu per job_id (stad relikty sprzed 0.3.0 nazwane
-    uuid4().mp4 i niedokonczone `*.part`).
+    A loose file at the top of these directories is an orphan by definition: the
+    current code always writes into a per-job_id subdirectory (hence pre-0.3.0
+    leftovers named uuid4().mp4 and unfinished `*.part` files).
 
-    Prog wieku jest tu konieczny, a nie ostrozny: `create_job` tworzy
-    uploads/{job_id} PRZED INSERT-em, wiec job w trakcie wgrywania zdjec przez
-    chwile wyglada dokladnie jak sierota.
+    The age threshold is required, not cautious: `create_job` makes
+    uploads/{job_id} BEFORE the INSERT, so a job mid-upload looks exactly like an
+    orphan for a moment.
     """
     db = await get_db()
     cur = await db.execute("SELECT id FROM jobs")
@@ -165,17 +164,17 @@ async def _purge_orphans() -> int:
 
 
 async def sweep(is_running: Callable[[str], bool] = _never_running) -> dict[str, int]:
-    """Jeden przebieg retencji. Zwraca liczniki do logu."""
+    """One retention pass. Returns counters for the log."""
     jobs = await _purge_old_jobs(is_running)
     orphans = await _purge_orphans()
     return {"jobs": jobs, "orphans": orphans}
 
 
 async def retention_loop(is_running: Callable[[str], bool] = _never_running) -> None:
-    """Sprzataj przy starcie, potem co `settings.cleanup_interval_h` godzin.
+    """Sweep at startup, then every `settings.cleanup_interval_h` hours.
 
-    Pierwszy przebieg od razu, bez czekania -- dzieki temu restart kontenera jest
-    pelnoprawnym sposobem wymuszenia sprzatania, takze przy testowaniu.
+    The first pass runs immediately, which makes restarting the container a
+    legitimate way to force a cleanup, testing included.
     """
     interval_s = settings.cleanup_interval_h * 3600
     while True:
@@ -189,9 +188,9 @@ async def retention_loop(is_running: Callable[[str], bool] = _never_running) -> 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Petla musi przezyc bledny przebieg. Wyjatek tutaj konczylby task po
-            # cichu i czyszczenie przestaloby dzialac az do nastepnego restartu,
-            # bez zadnego sygnalu poza rosnacym dyskiem.
+            # The loop must survive a failed pass. An exception here would end
+            # the task silently and cleanup would stop until the next restart,
+            # with no signal but a growing disk.
             print(f"[cleanup] sweep nieudany: {type(exc).__name__}: {exc}")
 
         await asyncio.sleep(interval_s)

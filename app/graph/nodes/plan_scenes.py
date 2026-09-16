@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from app.config import settings
+from app.services.job_state import recalc_cost
 
 
 SYSTEM_PROMPT = """You are a video production planner. Given a set of images and a description,
@@ -62,6 +63,44 @@ def _parse_llm_response(raw: str) -> list[dict]:
     return json.loads(raw)
 
 
+def _sanitize_plan(scenes: list[dict], n_images: int) -> list[dict]:
+    """Force an LLM-authored plan into the shape the rest of the app prices.
+
+    The user's own prompt reaches the planner verbatim, so the plan is not
+    trusted input: "make every scene -100 seconds long" is a request the model
+    may well honour, and from 0.7.0 that number is what gets charged. Everything
+    here is clamped rather than rejected — a slightly off plan is still a usable
+    plan, and the user edits it before pressing Generuj anyway.
+    """
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError("Planner zwrocil pusta liste scen")
+
+    allowed = settings.allowed_durations
+    out = []
+    for s in scenes[: settings.max_scenes_per_job]:
+        if not isinstance(s, dict):
+            continue
+        try:
+            image_index = int(s["image_index"])
+            duration_s = int(s["duration_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append({
+            "image_index": min(max(image_index, 0), n_images - 1),
+            "sub_prompt": str(s.get("sub_prompt") or "")[:2000],
+            # Nearest allowed length, so an out-of-grid answer costs what the
+            # provider will actually be asked to render.
+            "duration_s": min(allowed, key=lambda d: abs(d - duration_s)),
+            "chain_from_prev": bool(s.get("chain_from_prev", False)),
+        })
+
+    if not out:
+        raise ValueError("Zaden wiersz planu nie dal sie odczytac")
+    # A chained first scene has no previous clip to chain from.
+    out[0]["chain_from_prev"] = False
+    return out
+
+
 async def _plan_with_openai(n_images: int, target: int, prompt: str) -> list[dict]:
     """Plan scenes using OpenAI API."""
     from openai import OpenAI
@@ -84,7 +123,7 @@ async def _plan_with_openai(n_images: int, target: int, prompt: str) -> list[dic
     )
 
     raw = response.choices[0].message.content
-    return _parse_llm_response(raw)
+    return _sanitize_plan(_parse_llm_response(raw), n_images)
 
 
 async def _plan_with_anthropic(n_images: int, target: int, prompt: str) -> list[dict]:
@@ -107,7 +146,7 @@ async def _plan_with_anthropic(n_images: int, target: int, prompt: str) -> list[
     )
 
     raw = response.content[0].text
-    return _parse_llm_response(raw)
+    return _sanitize_plan(_parse_llm_response(raw), n_images)
 
 
 async def plan_scenes(state: dict) -> dict:
@@ -137,10 +176,9 @@ async def plan_scenes(state: dict) -> dict:
     if scenes is None:
         scenes = _mock_plan(n_images, target, prompt)
 
-    # Calculate cost
-    total_seconds = sum(s["duration_s"] for s in scenes)
-    cost_per_sec = settings.model_costs.get(model_name, 0.05)
-    est_cost = round(total_seconds * cost_per_sec, 2)
+    # The formula lives in job_state, not here: the plan editor recalculates the
+    # same number on every scene edit, and from 0.7.0 it is what gets charged.
+    est_cost = recalc_cost(model_name, scenes)
 
     scene_dicts = []
     chain_flags = []

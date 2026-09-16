@@ -138,26 +138,61 @@ Zaleznosci: brak
 Priorytet: KRYTYCZNY
 Zaleznosci: Faza 2 (konta uzytkownikow)
 
-### 3.1 System kredytow wewnetrznych
-- [ ] Tabela `credits (id, user_id, amount, type, description, created_at)`
+### 3.0 Uszczelnienie wyceny — ZROBIONE (0.7.0)
+Warunek konieczny przed ledgerem: kredyty sa tylko tak wiarygodne, jak liczba,
+ktora rezerwuja.
+- [x] `duration_s` z allowlisty (`ALLOWED_DURATIONS`) w `/scenes/{idx}/update`
+      **i** w `SceneItem` — `-100` dawalo ujemna rezerwacje, czyli doladowanie
+- [x] `MAX_SCENES_PER_JOB` — `/scenes/sync` przyjmuje liste wprost od klienta
+- [x] Nieznany model rzuca zamiast wyceniac sie po stawce Wana
+      (`cost_per_second`), `create_job` odrzuca go z 400
+- [x] `_sanitize_plan()` — prompt uzytkownika trafia do LLM doslownie, wiec plan
+      nie jest zaufanym wejsciem
+- [x] Jedna formula kosztu zamiast trzech (znikly kopie z `plan_scenes.py`
+      i `app.js`; ta w JS liczyla z modelu wybranego w formularzu, nie z modelu joba)
+- [x] `already_rendered()` → `job_state.is_rendered()` — wycena wznowienia musi
+      dawac te sama odpowiedz, co pomijanie scen w generacji
+
+### 3.1 System kredytow wewnetrznych — ZROBIONE (0.7.0)
+- [x] Tabela `credits` (+ `job_id`, `ext_id UNIQUE`, `balance_after`)
   - `type`: `purchase` | `usage` | `refund` | `bonus`
-- [ ] Kolumna `credit_balance` w tabeli `users`
-- [ ] Koszt joba = suma sekund * stawka modelu (juz wyliczane)
-- [ ] Blokada generacji jesli brak kredytow
-- [ ] Odejmowanie kredytow po ukonczeniu generacji (nie przed — zeby nie brac za nieudane)
-- [ ] Refund kredytow przy bledzie generacji
+- [x] Kolumna `credit_balance` w `users` — **autorytatywna**, `SUM(credits)` to
+      audyt. Jedno wspoldzielone polaczenie bez transakcji sprawia, ze atomowe
+      jest tylko pojedyncze zdanie SQL (`UPDATE ... WHERE credit_balance >= ?`
+      + `RETURNING`), a `SELECT SUM` → `INSERT` to wyscig
+- [x] 1 kredyt = 1 cent USD, `CREDIT_MARGIN` nad cennikiem fal.ai
+- [x] Blokada generacji przy braku pokrycia — 402, nie 409
+- [x] ~~Odejmowanie po ukonczeniu~~ → **rezerwacja przy starcie + zwrot roznicy**.
+      Intencja („nie bierzemy za nieudane") zostaje, realizuje ja `refund`.
+      Pobor po fakcie zostawialby kilkanascie minut generacji bez zadnej kontroli
+      budzetu — trzy rownolegle joby wychodzily na minus
+- [x] Refund przy bledzie — `settle_job()` w `finally` (`CancelledError` nie jest
+      `Exception`, wiec `except` nie lapie zamkniecia kontenera) + sweep startowy
+- [x] Kredyty powitalne `WELCOME_CREDITS`, idempotentne po `ext_id`
 
-### 3.2 Doladowywanie kredytow — Stripe
-- [ ] Stripe Checkout Session — pakiety kredytow:
-  - np. $5 / $15 / $50 (z bonusem za wiekszy pakiet)
-- [ ] Webhook `checkout.session.completed` — dodanie kredytow do konta
-- [ ] Strona "Doladuj kredyty" w UI
-- [ ] Historia transakcji (zakupy + uzycia)
+### 3.2 Doladowywanie kredytow — Stripe — ZROBIONE (0.7.0)
+- [x] Stripe Checkout Session, pakiety $5 / $15 / $50 z bonusem za wiekszy
+- [x] Webhook `checkout.session.completed`, podpis HMAC z surowych bajtow,
+      idempotencja po `UNIQUE(ext_id)`. **Wlasny router bez `require_user`** —
+      Stripe nie wysyla ciasteczka sesji
+- [x] Bez SDK, na `httpx` — jak Resend; `pip install` to najciezszy moment deployu
+- [x] `STRIPE_ENABLED=false` domyslnie: lokalny development bez konta Stripe
+- [x] Ekran "Kredyty" + historia transakcji
+- [ ] Faktury / paragony — Stripe pobiera platnosc, ale nic nie wystawia dokumentu
 
-### 3.3 Ekran potwierdzenia kosztu
-- [ ] Na ekranie planu: "Ten film zuzyje X kredytow (masz Y)"
-- [ ] Jesli za malo — przycisk "Doladuj" zamiast "Generuj"
-- [ ] Po generacji — podsumowanie: ile zuzyto, ile zostalo
+### 3.3 Ekran potwierdzenia kosztu — ZROBIONE (0.7.0)
+- [x] "Ten film zuzyje X kredytow (masz Y)" na ekranie planu
+- [x] Przycisk "Doladuj" **zamiast** "Generuj" przy niedoborze; 402 zostaje jako
+      zabezpieczenie, bo saldo mogl w miedzyczasie zjesc inny job
+- [x] Podsumowanie po generacji — zdarzenie SSE `credits` (zwrot + saldo)
+- [ ] Saldo nie odswieza sie samo w innych kartach tej samej sesji
+
+### 3.4 Otwarte po 0.7.0
+- [ ] Rzeczywisty koszt u fal.ai przy retry to do 3x stawka sceny
+      (`clip_max_retries = 2`), a uzytkownik placi 1x — pokrywa to marza,
+      ale nikt tego nie mierzy
+- [ ] Brak wygasania kredytow i zwrotu pieniedzy (tylko kredytow)
+- [ ] Planowanie (koszt LLM) jest darmowe — do decyzji, czy ma takie zostac
 
 ---
 

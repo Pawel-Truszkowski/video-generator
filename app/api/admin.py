@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.api.jobs import remove_job
 from app.auth.deps import JOB_ID_RE, require_admin
 from app.db import get_db
+from app.services import credits
 
 # Router-level dependency, as in jobs.py: a route added here later cannot be
 # left open by forgetting it. Handlers that need the admin's own row declare
@@ -63,15 +64,21 @@ async def admin_delete_job(job_id: str, admin: aiosqlite.Row = Depends(require_a
 
 @router.get("/users")
 async def admin_list_users():
-    """All accounts with their job count and summed cost.
+    """All accounts with their job count, credit balance and real spend.
 
-    The cost is the planner's `est_cost_usd`, not what fal.ai actually billed —
-    nothing records real spend until Faza 3. No pagination: a PoC with a
-    handful of accounts.
+    Two different numbers, deliberately both shown: `est_cost_usd` is what the
+    planner predicted, `credits_spent` is what the ledger actually took (usage
+    minus refunds). They diverge exactly where the estimate was wrong — a failed
+    scene, a retry, a job abandoned after planning.
+
+    Two separate aggregates rather than one query with two LEFT JOINs: joining
+    both jobs and credits multiplies the rows and every SUM comes out wrong.
+    No pagination: a PoC with a handful of accounts.
     """
     db = await get_db()
     rows = await db.execute(
         "SELECT u.id, u.email, u.created_at, u.last_login_at, u.is_active, u.is_admin, "
+        "       u.credit_balance, "
         "       COUNT(j.id) AS job_count, "
         "       COALESCE(SUM(j.est_cost_usd), 0) AS est_cost_usd "
         "  FROM users u "
@@ -79,7 +86,52 @@ async def admin_list_users():
         " GROUP BY u.id "
         " ORDER BY u.created_at DESC"
     )
-    return {"users": [dict(r) for r in await rows.fetchall()]}
+    users = [dict(r) for r in await rows.fetchall()]
+
+    spent = await db.execute(
+        "SELECT user_id, -COALESCE(SUM(amount), 0) AS credits_spent "
+        "  FROM credits WHERE type IN ('usage', 'refund') GROUP BY user_id"
+    )
+    by_user = {r["user_id"]: r["credits_spent"] for r in await spent.fetchall()}
+    for u in users:
+        u["credits_spent"] = by_user.get(u["id"], 0)
+
+    return {"users": users}
+
+
+class CreditsGrant(BaseModel):
+    amount: int
+    description: str = "Korekta administratora"
+
+
+@router.post("/users/{user_id}/credits")
+async def admin_grant_credits(
+    user_id: str,
+    body: CreditsGrant,
+    admin: aiosqlite.Row = Depends(require_admin),
+):
+    """Add (or subtract) credits by hand. The only top-up path without Stripe.
+
+    A negative amount is allowed on purpose: without it there is no way to undo a
+    mistake or to take an account to zero when testing the generation block. It
+    goes through the same grant() as a purchase, so ledger and balance cannot
+    drift. No ext_id — this is a deliberate one-off human decision, not an event
+    to be replayed: two grants of 100 must total 200.
+    """
+    if body.amount == 0:
+        raise HTTPException(400, "Kwota nie może być zerowa")
+
+    db = await get_db()
+    cur = await db.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+    if await cur.fetchone() is None:
+        raise HTTPException(404, "Nie znaleziono użytkownika")
+
+    new_balance = await credits.grant(
+        user_id, body.amount, credits.BONUS, body.description
+    )
+
+    print(f"[admin] {admin['email']} zmienil saldo {user_id} o {body.amount} -> {new_balance}")
+    return {"id": user_id, "amount": body.amount, "balance": new_balance}
 
 
 class ActiveUpdate(BaseModel):

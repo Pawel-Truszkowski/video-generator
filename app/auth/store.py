@@ -7,6 +7,7 @@ import aiosqlite
 from app.auth.tokens import hash_token
 from app.config import settings
 from app.db import get_db
+from app.services import credits
 
 # ISO-8601 with an explicit Z. NOT datetime('now'), which yields
 # "2026-07-30 12:34:56" — no zone marker, so new Date() in the browser parses it
@@ -38,6 +39,10 @@ async def get_or_create_user(email: str) -> aiosqlite.Row:
         (user_id, email, is_admin),
     )
     await db.commit()
+
+    # Before re-reading the row, not after: otherwise we would return a record
+    # with the old zero balance and the topbar would show 0 until the next call.
+    await credits.sync_welcome_credits(user_id)
 
     cur = await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     return await cur.fetchone()

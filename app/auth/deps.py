@@ -56,7 +56,8 @@ async def get_current_user(request: Request) -> aiosqlite.Row | None:
     # account out everywhere immediately.
     db = await get_db()
     cur = await db.execute(
-        "SELECT id, email, created_at, is_active, is_admin FROM users WHERE id = ? AND is_active = 1",
+        "SELECT id, email, created_at, is_active, is_admin, credit_balance "
+        "  FROM users WHERE id = ? AND is_active = 1",
         (user_id,),
     )
     return await cur.fetchone()

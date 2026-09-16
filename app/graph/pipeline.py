@@ -8,7 +8,7 @@ from app.graph.nodes.validate import validate
 from app.graph.nodes.plan_scenes import plan_scenes
 from app.graph.nodes.generate_clips import generate_clips
 from app.graph.nodes.stitch import stitch
-from app.services import job_state
+from app.services import credits, job_state
 
 # SSE event bus — job_id → one queue per connected subscriber.
 _event_queues: dict[str, list[asyncio.Queue]] = {}
@@ -73,6 +73,41 @@ async def _update_job_status(job_id: str, status: str, error: str | None = None,
     await db.commit()
 
 
+async def _settle_and_emit(job_id: str) -> None:
+    """Settle the job's credit reservation and tell the browser.
+
+    Called from `finally`, not `except`: asyncio.CancelledError inherits from
+    BaseException, so the `except Exception` below does not catch a container
+    shutdown mid-generation — the most likely moment for a reservation to vanish.
+    settle_job() is idempotent, so the startup sweep repeating it is harmless.
+
+    A settlement error must not escape: raised from `finally` it would mask the
+    real pipeline exception, turning a readable generation failure into a
+    bookkeeping one.
+    """
+    try:
+        refunded = await credits.settle_job(job_id)
+    except Exception:
+        traceback.print_exc()
+        return
+
+    if not refunded:
+        return
+
+    db = await get_db()
+    cur = await db.execute("SELECT user_id FROM jobs WHERE id = ?", (job_id,))
+    row = await cur.fetchone()
+    balance = await credits.balance(row["user_id"]) if row and row["user_id"] else None
+
+    print(f"[job {job_id}] zwrot {refunded} kredytow za niewykonane sceny")
+    _emit(job_id, {
+        "type": "credits",
+        "refunded": refunded,
+        "spent": await credits.job_net_spent(job_id),
+        "balance": balance,
+    })
+
+
 async def run_planning(job_id: str, state: dict) -> dict:
     """Run validate + plan_scenes. Returns updated state."""
     try:
@@ -98,6 +133,7 @@ async def run_planning(job_id: str, state: dict) -> dict:
             "type": "planned",
             "scenes": state["scenes"],
             "est_cost_usd": state["est_cost_usd"],
+            "credits_cost": credits.credits_for(state["model"], state["scenes"]),
         })
 
         return state
@@ -165,3 +201,9 @@ async def run_generation(job_id: str, state: dict) -> dict:
         _emit(job_id, {"type": "error", "error": error_msg})
         traceback.print_exc()
         return {**state, "status": "error", "error": error_msg}
+
+    finally:
+        # Every exit from generation — success, error, incomplete plan, and a
+        # task cancelled at container shutdown — returns what was reserved but
+        # never rendered.
+        await _settle_and_emit(job_id)

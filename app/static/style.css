@@ -132,7 +132,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 .dev-link { display: block; margin: 8px 0; font-size: 0.8rem; color: #4f8cff; word-break: break-all; }
 
-/* Moje filmy */
+/* My videos */
 .job-card {
   background: #1a1d27; border: 1px solid #333; border-radius: 8px; padding: 12px;
   margin-bottom: 8px; display: flex; gap: 12px; align-items: flex-start;
@@ -156,7 +156,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   margin-top: 6px; font-size: 0.75rem; color: #888;
 }
 .job-actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
-/* Zajmuje miejsce po przycisku "Wznow", ktorego dla wyczyszczonego joba nie ma. */
+/* Fills the slot left by "Wznow", which a purged job does not get. */
 .job-note { color: #666; font-size: 0.75rem; padding: 4px 8px; font-style: italic; }
 .job-card video { width: 100%; margin-top: 8px; border-radius: 6px; }
 .status-badge.planned { background: #2d3748; color: #aaa; }
@@ -177,3 +177,32 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .admin-table td.error-text { color: #e74c3c; }
 .admin-tag { margin-left: 6px; font-size: 0.7rem; color: #e6a23c; border: 1px solid #e6a23c;
   border-radius: 3px; padding: 0 4px; }
+
+/* --- Credits (Faza 3) --- */
+
+/* Topbar balance: the same btn-link, but read as a value rather than an action. */
+.balance-chip {
+  background: #1e2a1e; border: 1px solid #2d5a3d; border-radius: 12px;
+  padding: 2px 10px; color: #4ade80; font-weight: 600;
+}
+.balance-chip:hover { background: #24331f; text-decoration: none; }
+
+/* Balance next to the cost on the plan screen. `.short` turns on when credits
+   are missing — the actions then offer "Doladuj" instead of "Generuj". */
+.cost-balance { margin-left: 10px; color: #888; font-size: 0.9rem; }
+.cost-balance.short { color: #e05260; font-weight: 600; }
+
+.packages { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+.package-card {
+  flex: 1 1 160px; background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+  padding: 16px; text-align: center;
+}
+.package-card:hover { border-color: #3a75e6; }
+.package-label { font-size: 0.85rem; color: #888; text-transform: uppercase; }
+.package-credits { font-size: 1.5rem; font-weight: 700; color: #27ae60; margin: 6px 0; }
+.package-price { color: #ccc; margin-bottom: 12px; }
+.package-card button { width: 100%; }
+
+/* History: the sign carries all the meaning here, so it gets the colour. */
+.amount-plus { color: #4ade80; font-weight: 600; }
+.amount-minus { color: #e0a060; font-weight: 600; }

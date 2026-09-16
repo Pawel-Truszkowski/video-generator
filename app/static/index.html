@@ -11,6 +11,9 @@
     <div class="topbar hidden" id="user-bar">
       <span class="topbar-email" id="user-email"></span>
       <span class="topbar-nav">
+        <button class="btn-link balance-chip" id="btn-credits" title="Doladuj kredyty">
+          <span id="balance-amount">-</span> kr
+        </button>
         <button class="btn-link" id="btn-new-video">Nowy film</button>
         <button class="btn-link" id="btn-my-videos">Moje filmy</button>
         <button class="btn-link hidden" id="btn-admin">Admin</button>
@@ -82,12 +85,14 @@
       <div class="actions" style="margin-bottom: 12px;">
         <button class="btn-primary" id="btn-add-scene">+ Dodaj scene</button>
       </div>
-      <div class="cost-box">
-        Szacowany koszt: <span class="amount" id="cost-amount">$0.00</span>
+      <div class="cost-box" id="cost-box">
+        Ten film zuzyje <span class="amount" id="cost-amount">-</span> kredytow
+        <span id="cost-balance" class="cost-balance"></span>
         <span id="total-duration" style="margin-left: 16px; color: #aaa;"></span>
       </div>
       <div class="actions">
         <button class="btn-success" id="btn-generate">Generuj film</button>
+        <button class="btn-primary hidden" id="btn-topup">Doladuj kredyty</button>
         <button class="btn-danger" id="btn-back">Wstecz</button>
       </div>
     </div>
@@ -125,7 +130,29 @@
       </div>
     </div>
 
-    <!-- SCREEN 5: Admin panel (Faza 2.3) -->
+    <!-- SCREEN 5: Kredyty (Faza 3) -->
+    <div id="screen-credits" class="hidden">
+      <h2>Kredyty</h2>
+      <div class="cost-box">
+        Saldo: <span class="amount" id="credits-balance">-</span> kredytow
+        <span class="cost-balance" id="credits-balance-usd"></span>
+      </div>
+
+      <div id="packages-off" class="empty-state hidden">
+        Platnosci sa wylaczone na tej instancji. Poproś administratora o kredyty.
+      </div>
+      <div id="packages-list" class="packages"></div>
+
+      <h3 style="margin-top: 28px;">Historia</h3>
+      <div class="table-wrap"><table class="admin-table" id="credits-history"></table></div>
+      <div id="credits-history-empty" class="empty-state hidden">Brak operacji.</div>
+
+      <div class="actions">
+        <button class="btn-primary" id="btn-credits-back">Wstecz</button>
+      </div>
+    </div>
+
+    <!-- SCREEN 6: Admin panel (Faza 2.3) -->
     <div id="screen-admin" class="hidden">
       <h2>Panel admina</h2>
 

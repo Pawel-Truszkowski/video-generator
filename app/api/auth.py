@@ -115,6 +115,10 @@ async def me(user: aiosqlite.Row = Depends(require_user)) -> dict:
         "email": user["email"],
         "created_at": user["created_at"],
         "is_admin": bool(user["is_admin"]),
+        # The frontend calls /auth/me at bootstrap anyway, so the topbar balance
+        # costs no extra request. The row is re-read from the DB on every request,
+        # so the number cannot go stale.
+        "credit_balance": user["credit_balance"],
     }
 
 

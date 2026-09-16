@@ -88,7 +88,6 @@ async def stitch_clips(
             raise RuntimeError(f"stitch single clip failed: {stderr.decode()}")
         return output_path
 
-    # Normalize all clips first
     norm_dir = os.path.join(work_dir, "normalized")
     os.makedirs(norm_dir, exist_ok=True)
 
@@ -98,18 +97,15 @@ async def stitch_clips(
         await normalize_clip(cp, norm_path)
         norm_paths.append(norm_path)
 
-    # Get durations for crossfade offsets
     durations = []
     for p in norm_paths:
         durations.append(await get_video_duration(p))
 
-    # Build complex filter with xfade
     xfade_dur = settings.crossfade_duration
     inputs = []
     for p in norm_paths:
         inputs.extend(["-i", p])
 
-    # Build xfade filter chain
     n = len(norm_paths)
     if n == 2:
         # Simple case: just one transition
@@ -118,7 +114,6 @@ async def stitch_clips(
             offset = durations[0] - xfade_dur
             filter_str = f"[0:v][1:v]xfade=transition=fade:duration={xfade_dur}:offset={offset}[outv]"
         else:
-            # Hard cut via concat
             filter_str = f"[0:v][1:v]concat=n=2:v=1:a=0[outv]"
 
         cmd = ["ffmpeg", "-y"] + inputs + [
@@ -130,7 +125,6 @@ async def stitch_clips(
         ]
     else:
         # Multi-clip: use concat for simplicity in POC
-        # Create a concat file
         concat_file = os.path.join(work_dir, "concat.txt")
         with open(concat_file, "w") as f:
             for p in norm_paths:
