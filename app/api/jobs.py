@@ -9,7 +9,7 @@ import uuid
 import aiosqlite
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from app.auth.deps import get_owned_job, require_user
@@ -21,7 +21,7 @@ from app.graph.pipeline import (
     run_generation,
     run_planning,
 )
-from app.services import cleanup, job_state
+from app.services import cleanup, credits, job_state
 from app.services.job_state import STALE_STATUSES
 
 # Every route here requires a session by construction, so a future route added to
@@ -114,6 +114,59 @@ def _assert_plan_editable(job: aiosqlite.Row, scenes: list[dict]) -> None:
         )
 
 
+def _assert_valid_duration(duration_s: int) -> None:
+    """Scene length is the only dimension of price, so it is an allowlist.
+
+    Until 0.7.0 this was unchecked and merely produced an odd plan. Now it is
+    what gets reserved: a negative duration would price the job below zero and
+    the reservation would *credit* the account instead of debiting it.
+    """
+    if duration_s not in settings.allowed_durations:
+        allowed = ", ".join(str(d) for d in settings.allowed_durations)
+        raise HTTPException(400, f"Nieprawidłowa długość sceny: {duration_s}s (dozwolone: {allowed})")
+
+
+def _assert_valid_model(model: str) -> None:
+    """Refuse a model with no price. See job_state.cost_per_second()."""
+    if model not in settings.model_costs:
+        known = ", ".join(sorted(settings.model_costs))
+        raise HTTPException(400, f"Nieznany model: {model} (dostępne: {known})")
+
+
+def _unrendered_scenes(job_id: str, scenes: list[dict]) -> list[dict]:
+    """Scenes the provider still has to be paid for.
+
+    A resume must skip clips already on disk, or the user pays twice for the same
+    seconds on every "Wznow". The answer comes from the same function
+    generate_clips uses to skip scenes (job_state.is_rendered), so pricing and
+    generation cannot disagree.
+    """
+    return [s for i, s in enumerate(scenes) if not job_state.is_rendered(job_id, i, s)]
+
+
+async def _charge(job: aiosqlite.Row, scenes: list[dict], description: str) -> None:
+    """Reserve credits for `scenes`, or refuse with a 402.
+
+    Called from the handler, before _start() — not inside it, even though that is
+    the one gate every task passes: _start is synchronous by design (see the
+    comment on _assert_slot_free) and a DB write needs `await`. There is no race
+    regardless, since try_charge checks funds and debits in one SQL statement.
+    """
+    amount = credits.credits_for(job["model"], scenes)
+    if amount <= 0:
+        return
+
+    try:
+        await credits.charge(job["user_id"], amount, job["id"], description)
+    except credits.InsufficientCredits as e:
+        # 402 Payment Required, not 409: this is missing funds rather than a
+        # state conflict, and the frontend tells them apart to offer "Doladuj".
+        raise HTTPException(
+            402,
+            f"Za mało kredytów: potrzeba {e.needed}, masz {e.available}. Doładuj konto.",
+        )
+
+
 def _assert_files_present(job: aiosqlite.Row) -> None:
     """Refuse anything that needs the job's source images back.
 
@@ -139,6 +192,10 @@ async def create_job(
     target_duration_s: int = Form(120),
     user: aiosqlite.Row = Depends(require_user),
 ):
+    # Before touching the disk: an unpriceable model would create a job that
+    # every later cost call refuses, with the uploads already written.
+    _assert_valid_model(model)
+
     job_id = uuid.uuid4().hex[:12]
     upload_dir = os.path.join(settings.data_dir, "uploads", job_id)
     os.makedirs(upload_dir, exist_ok=True)
@@ -239,6 +296,9 @@ async def generate_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job))
     if state is None or not state["scenes"]:
         raise HTTPException(400, "Brak planu dla tego joba")
 
+    # Charge before the start, so a refusal leaves the job exactly as it was.
+    await _charge(job, _unrendered_scenes(job_id, state["scenes"]), "Generacja filmu")
+
     _start(job_id, job["user_id"], run_generation(job_id, state))
 
     return {"status": "generating"}
@@ -259,6 +319,7 @@ async def update_scene(
         raise HTTPException(400, "Brak planu dla tego joba")
 
     _assert_plan_editable(job, state["scenes"])
+    _assert_valid_duration(duration_s)
 
     if idx < 0 or idx >= len(state["scenes"]):
         raise HTTPException(400, "Invalid scene index")
@@ -280,7 +341,14 @@ async def update_scene(
     est_cost = job_state.recalc_cost(state["model"], state["scenes"])
     await job_state.set_job_cost(job_id, est_cost)
 
-    return {"est_cost_usd": est_cost}
+    # credits_cost rides on every plan-changing response so the editor shows the
+    # number computed HERE. Until 0.6.0 app.js kept its own price table and showed
+    # the wrong model's rate after a resume — harmless while it was an estimate,
+    # not while it is the amount about to leave the account.
+    return {
+        "est_cost_usd": est_cost,
+        "credits_cost": credits.credits_for(state["model"], state["scenes"]),
+    }
 
 
 class SceneItem(BaseModel):
@@ -289,9 +357,22 @@ class SceneItem(BaseModel):
     duration_s: int
     chain_from_prev: bool = False
 
+    @field_validator("duration_s")
+    @classmethod
+    def _known_duration(cls, v: int) -> int:
+        # Same allowlist as _assert_valid_duration, enforced here because this
+        # body arrives straight from the client and is priced as-is. A 422 from
+        # pydantic is fine — errText() in app.js already surfaces its detail.
+        if v not in settings.allowed_durations:
+            allowed = ", ".join(str(d) for d in settings.allowed_durations)
+            raise ValueError(f"Nieprawidłowa długość sceny: {v}s (dozwolone: {allowed})")
+        return v
+
 
 class SyncScenesRequest(BaseModel):
-    scenes: list[SceneItem]
+    # Upper bound on plan length: this endpoint replaces the whole scene list
+    # with whatever the client sends, and every scene is a paid provider call.
+    scenes: list[SceneItem] = Field(..., max_length=settings.max_scenes_per_job)
 
 
 @router.post("/jobs/{job_id}/scenes/sync")
@@ -319,7 +400,11 @@ async def sync_scenes(
     est_cost = job_state.recalc_cost(state["model"], scenes)
     await job_state.set_job_cost(job_id, est_cost)
 
-    return {"est_cost_usd": est_cost, "scene_count": len(scenes)}
+    return {
+        "est_cost_usd": est_cost,
+        "credits_cost": credits.credits_for(state["model"], scenes),
+        "scene_count": len(scenes),
+    }
 
 
 @router.get("/jobs/{job_id}")
@@ -340,6 +425,13 @@ async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
         "aspect_ratio": job["aspect_ratio"],
         "target_duration_s": job["target_duration_s"],
         "est_cost_usd": job["est_cost_usd"],
+        "credits_cost": credits.credits_for(job["model"], scenes),
+        # What finishing this job would cost now: scenes whose clip is on disk
+        # are already paid for. This, not the full plan cost, is what "Wznow"
+        # turns on.
+        "credits_pending": credits.credits_for(
+            job["model"], _unrendered_scenes(job_id, scenes)
+        ),
         "created_at": job["created_at"],
         "error": job["error"],
         "files_purged": bool(job["workdirs_purged_at"]),
@@ -468,6 +560,10 @@ async def retry_scene(job_id: str, idx: int, job: aiosqlite.Row = Depends(get_ow
     _assert_files_present(job)
     _assert_scene_retryable(job, state["scenes"][idx])
 
+    # Same reason as the checks above: refusing after the wipe would leave the
+    # scene cleared with nothing running to refill it.
+    await _charge(job, [state["scenes"][idx]], f"Ponowienie sceny {idx + 1}")
+
     await job_state.reset_scene(job_id, idx)
     # The status reset alone would be enough for already_rendered(), but a
     # half-written file from a cancelled attempt must not outlive it.
@@ -524,6 +620,9 @@ async def resume_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
         await _set_status(job_id, "uploaded")
         _start(job_id, job["user_id"], run_planning(job_id, state))
     elif stage == "generating":
+        # Only scenes with no clip yet: reserving the full est_cost_usd would
+        # bill a second time for everything rendered before the interruption.
+        await _charge(job, _unrendered_scenes(job_id, state["scenes"]), "Wznowienie generacji")
         _start(job_id, job["user_id"], run_generation(job_id, state))
     # "planned"/"done" need no task — the frontend just opens the right screen.
 

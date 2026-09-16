@@ -104,10 +104,48 @@ def image_paths_for(job_id: str) -> list[str]:
 
 # --- Cost ---------------------------------------------------------------------
 
+class UnknownModelError(ValueError):
+    """A model with no entry in settings.model_costs cannot be priced."""
+
+
+def cost_per_second(model: str) -> float:
+    """USD per second of video for `model`. Raises on an unknown model.
+
+    Deliberately not `.get(model, 0.05)`: that silently priced anything
+    unrecognised at the cheapest model's rate. Harmless while the number was a
+    display-only estimate, but from 0.7.0 it is what gets charged, so a typo in
+    the model name would hand out video at Wan prices -- or below cost.
+    """
+    try:
+        return settings.model_costs[model]
+    except KeyError:
+        raise UnknownModelError(f"Brak cennika dla modelu: {model}") from None
+
+
 def recalc_cost(model: str, scenes: list[dict]) -> float:
     """Single implementation of the cost formula."""
-    cost_per_sec = settings.model_costs.get(model, 0.05)
-    return round(sum(s["duration_s"] for s in scenes) * cost_per_sec, 2)
+    return round(sum(s["duration_s"] for s in scenes) * cost_per_second(model), 2)
+
+
+# --- Rendered-clip check ------------------------------------------------------
+
+def is_rendered(job_id: str, idx: int, scene: dict) -> bool:
+    """True when scene `idx` already has a usable clip and needs no provider call.
+
+    Lives here rather than inside generate_clips because two callers need the
+    same answer for different reasons: the pipeline skips the scene, and the API
+    layer prices a resume/retry from "how many scenes are actually left". Two
+    copies of the rule would drift, and this one decides what the user pays.
+    """
+    if scene.get("status") != "done":
+        return False
+    out_path = clip_path_for(job_id, idx)
+    # The disk gets the final word. `scene["clip_path"]` is deliberately not
+    # consulted: older rows point at a uuid name that stitch would never find.
+    if not os.path.exists(out_path):
+        return False
+    # A crashed download or a killed ffmpeg leaves a 0-byte file behind.
+    return os.path.getsize(out_path) > 0
 
 
 # --- Read ---------------------------------------------------------------------
@@ -255,17 +293,29 @@ async def mark_scene_error(job_id: str, idx: int, error: str) -> None:
     await db.commit()
 
 
-async def reconcile_interrupted() -> int:
+async def reconcile_interrupted() -> list[str]:
     """Startup sweep: flag jobs whose pipeline died with the previous process.
 
     Safe because the app runs a single uvicorn worker in a single container, so
-    at startup nothing can legitimately be mid-flight. Returns rows touched.
+    at startup nothing can legitimately be mid-flight.
+
+    Returns the ids it touched, not a count: each of those jobs may hold a
+    credit reservation that died with the task, and the caller settles them.
+    Ids rather than a settle call here, because credits imports this module for
+    the cost formula -- the dependency has to point one way.
     """
     db = await get_db()
     placeholders = ", ".join("?" * len(STALE_STATUSES))
     cur = await db.execute(
+        f"SELECT id FROM jobs WHERE status IN ({placeholders})", STALE_STATUSES
+    )
+    job_ids = [r["id"] for r in await cur.fetchall()]
+    if not job_ids:
+        return []
+
+    await db.execute(
         f"UPDATE jobs SET status = 'interrupted' WHERE status IN ({placeholders})",
         STALE_STATUSES,
     )
     await db.commit()
-    return cur.rowcount
+    return job_ids

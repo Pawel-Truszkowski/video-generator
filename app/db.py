@@ -48,6 +48,38 @@ CREATE TABLE IF NOT EXISTS magic_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_magic_tokens_user ON magic_tokens(user_id);
 
+-- Append-only credit ledger (Faza 3). NOT the source of the balance -- that is
+-- users.credit_balance, because on one shared connection without explicit
+-- transactions only a single SQL statement is atomic, and "SELECT SUM -> check
+-- -> INSERT" is exactly the race consume_magic_token avoids. This table is the
+-- audit trail, the user's history and the Stripe webhook's idempotency key.
+CREATE TABLE IF NOT EXISTS credits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    -- Positive = top-up, negative = spend. Never 0.
+    amount INTEGER NOT NULL,
+    -- purchase | usage | refund | bonus
+    type TEXT NOT NULL,
+    -- For usage/refund: which job this belongs to. settle_job() computes the
+    -- refund from this column, so without it no refund could be derived.
+    job_id TEXT,
+    -- External operation key: a Stripe session id, "welcome:<user_id>", etc.
+    -- UNIQUE is the idempotency mechanism -- Stripe retries webhooks, and a
+    -- double top-up is worse than none. SQLite allows many NULLs, so usage and
+    -- refund rows do not contend for it.
+    ext_id TEXT UNIQUE,
+    description TEXT,
+    -- Balance after the operation. Nothing is computed from it; it exists to
+    -- expose a drift between the ledger and the column in users.
+    balance_after INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- One user's history, newest first -- the only read on the "Kredyty" screen.
+CREATE INDEX IF NOT EXISTS idx_credits_user ON credits(user_id, created_at DESC);
+-- settle_job() asks for "every row of this job" after each generation.
+CREATE INDEX IF NOT EXISTS idx_credits_job ON credits(job_id);
+
 -- Every read of a job's plan is "all scenes of one job, in order" (load_state,
 -- GET /jobs/{id}). Not UNIQUE: an existing DB could already hold duplicate
 -- (job_id, idx) pairs and creating the index would then fail at startup.
@@ -93,11 +125,10 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         )
 
     if "workdirs_purged_at" not in cols:
-        # Kiedy retencja skasowala material roboczy joba (uploads/frames/clips).
-        # NULL = jeszcze nie sprzatany, co dla starych wierszy jest prawda.
-        # Nie da sie tego wywnioskowac z dysku: brak katalogu znaczy tez "job
-        # nigdy nie mial plikow" albo "wolumin sie nie zamontowal", a te trzy
-        # przypadki wymagaja innej odpowiedzi na probe wznowienia.
+        # When retention removed the job's working material. NULL = not swept
+        # yet, which is true for old rows. The disk cannot answer this: a missing
+        # directory also means "never had files" or "volume did not mount", and
+        # the three cases need different answers to a resume attempt.
         await db.execute("ALTER TABLE jobs ADD COLUMN workdirs_purged_at TEXT")
 
     scene_cols = await _column_names(db, "scenes")
@@ -133,10 +164,15 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     user_cols = await _column_names(db, "users")
 
     if "is_admin" not in user_cols:
-        # Stala wartosc domyslna, wiec bez backfillu: istniejace konta sa
-        # zwyklymi uzytkownikami, dopoki sync_admins() przy starcie nie
-        # przepisze na nie ADMIN_EMAILS.
+        # A constant default, so no backfill: existing accounts are ordinary
+        # users until sync_admins() applies ADMIN_EMAILS at startup.
         await db.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+
+    if "credit_balance" not in user_cols:
+        # The authoritative balance (Faza 3), in credits = US cents. Zero, no
+        # backfill: credits.sync_welcome_credits() hands out the welcome credits,
+        # so a schema migration does not decide pricing policy.
+        await db.execute("ALTER TABLE users ADD COLUMN credit_balance INTEGER NOT NULL DEFAULT 0")
 
     await db.commit()
 

@@ -5,6 +5,12 @@
   let eventSource = null;
   let currentScenes = [];
   let currentUser = null;
+  // Credit balance and the current plan's cost, both from the server ONLY. Until
+  // 0.6.0 app.js priced the plan from its own copy of the rate table and showed
+  // the wrong model's rate after a resume — cosmetic while the number was an
+  // estimate, a complaint once it leaves the account.
+  let currentBalance = 0;
+  let currentCost = null;
   // How many source images the job has, per the API: `files` is empty after a
   // resume, so the image picker has to count from the server instead.
   let imageCount = 0;
@@ -65,8 +71,21 @@
   const adminUsers = document.getElementById('admin-users');
   const adminStatusFilter = document.getElementById('admin-status-filter');
 
+  // Credits (Faza 3)
+  const btnCredits = document.getElementById('btn-credits');
+  const balanceAmount = document.getElementById('balance-amount');
+  const costBalance = document.getElementById('cost-balance');
+  const btnTopup = document.getElementById('btn-topup');
+  const creditsBalance = document.getElementById('credits-balance');
+  const creditsBalanceUsd = document.getElementById('credits-balance-usd');
+  const packagesList = document.getElementById('packages-list');
+  const packagesOff = document.getElementById('packages-off');
+  const creditsHistory = document.getElementById('credits-history');
+  const creditsHistoryEmpty = document.getElementById('credits-history-empty');
+  const btnCreditsBack = document.getElementById('btn-credits-back');
+
   // Screens are mutually exclusive; showScreen is the only thing that toggles them.
-  const SCREEN_IDS = ['screen-login', 'screen-form', 'screen-plan', 'screen-progress', 'screen-jobs', 'screen-admin'];
+  const SCREEN_IDS = ['screen-login', 'screen-form', 'screen-plan', 'screen-progress', 'screen-jobs', 'screen-credits', 'screen-admin'];
 
   function showScreen(id) {
     SCREEN_IDS.forEach(s => {
@@ -107,6 +126,36 @@
     }
   }
 
+  function formatUsd(credits) {
+    return '$' + (credits / 100).toFixed(2);
+  }
+
+  function setBalance(value) {
+    currentBalance = Number(value) || 0;
+    balanceAmount.textContent = currentBalance;
+    creditsBalance.textContent = currentBalance;
+    creditsBalanceUsd.textContent = '(' + formatUsd(currentBalance) + ')';
+    updateCostBox();
+  }
+
+  /** Koszt planu wzgledem salda: decyduje, czy w ogole pokazac "Generuj". */
+  function updateCostBox() {
+    costAmount.textContent = currentCost == null ? '-' : currentCost;
+    const enough = currentCost == null || currentCost <= currentBalance;
+    costBalance.textContent = `(masz ${currentBalance})`;
+    costBalance.classList.toggle('short', !enough);
+    // Same pattern as hiding "Wznow" on files_purged: do not offer a button the
+    // server will refuse. The 402 stays as a backstop, since another job may have
+    // eaten the balance in the meantime.
+    btnGenerate.classList.toggle('hidden', !enough);
+    btnTopup.classList.toggle('hidden', enough);
+  }
+
+  function setCost(credits) {
+    currentCost = credits == null ? null : Number(credits);
+    updateCostBox();
+  }
+
   function onLoggedOut() {
     currentUser = null;
     if (eventSource) { eventSource.close(); eventSource = null; }
@@ -120,14 +169,12 @@
     showScreen('screen-login');
   }
 
-  // Duration slider
   durationEl.addEventListener('input', () => {
     const v = parseInt(durationEl.value);
     const m = Math.floor(v / 60);
     const s = v % 60;
     durationLabel.textContent = m > 0 ? `${m}m ${s}s` : `${v}s`;
   });
-  // Init label
   durationEl.dispatchEvent(new Event('input'));
 
   // Drag & drop
@@ -174,7 +221,6 @@
   }
   promptEl.addEventListener('input', updatePlanButton);
 
-  // Plan
   btnPlan.addEventListener('click', async () => {
     btnPlan.disabled = true;
     btnPlan.textContent = 'Planowanie...';
@@ -210,7 +256,7 @@
     eventSource.addEventListener('planned', e => {
       const data = JSON.parse(e.data);
       currentScenes = data.scenes;
-      showPlanScreen(data.est_cost_usd);
+      showPlanScreen(data.credits_cost);
     });
 
     eventSource.addEventListener('status', e => {
@@ -231,6 +277,18 @@
       renderSceneProgress();
     });
     
+    // Refund for scenes that failed. Emitted from the pipeline's `finally`, so it
+    // arrives after a failed generation too, not only a successful one.
+    eventSource.addEventListener('credits', e => {
+      const data = JSON.parse(e.data);
+      if (data.balance != null) setBalance(data.balance);
+      if (data.refunded) {
+        progressDetail.textContent =
+          `Zwrocono ${data.refunded} kredytow za niewykonane sceny. ` +
+          `Zuzyto ${data.spent}, saldo: ${currentBalance}.`;
+      }
+    });
+
     eventSource.addEventListener('done', e => {
       const data = JSON.parse(e.data);
       showDone(data.final_path);
@@ -272,23 +330,19 @@
     progressDetail.textContent = translateStatus(status);
   }
 
-  // Cost per second by model
-  const modelCosts = { 'wan': 0.05, 'kling-2.5-turbo': 0.07, 'veo-3.1-fast': 0.10 };
-
-  function recalcCost() {
+  /** Total plan duration. The price is the server's — see setCost(). */
+  function recalcDuration() {
     const totalS = currentScenes.reduce((sum, s) => sum + s.duration_s, 0);
-    const cps = modelCosts[modelEl.value] || 0.05;
-    const cost = (totalS * cps).toFixed(2);
-    costAmount.textContent = '$' + cost;
     const m = Math.floor(totalS / 60);
     const s = totalS % 60;
     totalDuration.textContent = `(${m}m ${s}s)`;
   }
 
-  function showPlanScreen(cost) {
+  function showPlanScreen(creditsCost) {
     showScreen('screen-plan');
     renderScenes();
-    recalcCost();
+    recalcDuration();
+    setCost(creditsCost);
     btnPlan.disabled = false;
     btnPlan.textContent = 'Zaplanuj';
     // showProgressScreen() disables it, and a resume can land here afterwards.
@@ -330,7 +384,6 @@
         idx.appendChild(removeBtn);
       }
 
-      // Prompt textarea
       const ta = document.createElement('textarea');
       ta.value = s.sub_prompt;
       ta.addEventListener('change', () => {
@@ -353,7 +406,7 @@
       });
       durSel.addEventListener('change', () => {
         currentScenes[i].duration_s = parseInt(durSel.value);
-        recalcCost();
+        recalcDuration();
         syncScenesToBackend(i);
       });
 
@@ -393,11 +446,10 @@
       currentScenes[0].chain_from_prev = false;
     }
     renderScenes();
-    recalcCost();
+    recalcDuration();
     syncAllScenes();
   }
 
-  // Add scene button
   btnAddScene.addEventListener('click', () => {
     const newScene = {
       image_index: 0,
@@ -407,7 +459,7 @@
     };
     currentScenes.push(newScene);
     renderScenes();
-    recalcCost();
+    recalcDuration();
     syncAllScenes();
   });
 
@@ -418,34 +470,50 @@
     fd.append('duration_s', s.duration_s);
     fd.append('image_index', s.image_index);
     try {
-      await apiFetch(`/jobs/${jobId}/scenes/${idx}/update`, { method: 'POST', body: fd });
+      const res = await apiFetch(`/jobs/${jobId}/scenes/${idx}/update`, { method: 'POST', body: fd });
+      // Until 0.6.0 this response was discarded and the UI showed its own sum.
+      if (res.ok) setCost((await res.json()).credits_cost);
     } catch (_) {}  // apiFetch has already switched screens on 401
   }
 
   async function syncAllScenes() {
     try {
-      await apiFetch(`/jobs/${jobId}/scenes/sync`, {
+      const res = await apiFetch(`/jobs/${jobId}/scenes/sync`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenes: currentScenes }),
       });
+      if (res.ok) setCost((await res.json()).credits_cost);
     } catch (_) {}
   }
 
-  // Generate
   btnGenerate.addEventListener('click', async () => {
-    // Sync all scenes before generating
     await syncAllScenes();
 
     showProgressScreen();
 
     try {
       const res = await apiFetch(`/jobs/${jobId}/generate`, { method: 'POST' });
+      if (res.status === 402) {
+        // Short credits is not a generation failure: go back to the plan, where
+        // "Doladuj" lives, instead of stranding the user on the progress screen
+        // with a red error and nothing to click.
+        const msg = await errText(res);
+        await refreshBalance();
+        showPlanScreen(currentCost);
+        planError(msg);
+        return;
+      }
       if (!res.ok) throw new Error(await errText(res));
     } catch (e) {
       if (e.message !== 'UNAUTHORIZED') showError(e.message);
     }
   });
+
+  function planError(msg) {
+    costBalance.textContent = msg;
+    costBalance.classList.add('short');
+  }
 
   const SCENE_STATUS_LABELS = {
     pending: 'Oczekuje', generating: 'Generowanie', done: 'Gotowe', error: 'Blad',
@@ -543,7 +611,6 @@
     loadSceneProgress();
   }
 
-  // Back
   btnBack.addEventListener('click', () => {
     showScreen('screen-form');
   });
@@ -720,7 +787,9 @@
     }
 
     if (stage === 'planned') {
-      showPlanScreen(detail.est_cost_usd);
+      // credits_pending, not credits_cost: scenes with a finished clip are paid
+      // for, so the editor shows what FINISHING the job costs.
+      showPlanScreen(detail.credits_pending);
     } else if (stage === 'generating') {
       showProgressScreen('Wznawianie generowania...');
     } else if (stage === 'planning') {
@@ -830,6 +899,14 @@
       resume.className = 'btn-link';
       resume.textContent = 'Wznow';
       resume.onclick = () => resumeJob(job);
+      // The exact cost depends on which clips are on disk, which the job list
+      // does not know. Zero is unambiguous though — it covers nothing — so the
+      // button would only disappoint. Above zero the server decides (402 with
+      // the actual amount).
+      if (currentBalance <= 0) {
+        resume.disabled = true;
+        resume.title = 'Brak kredytow - doladuj konto';
+      }
       actions.appendChild(resume);
     }
 
@@ -996,6 +1073,47 @@
     loadAdminUsers();
   }
 
+  async function adminGrantCredits(u, btn) {
+    const raw = prompt(
+      `Ile kredytow dodac do konta ${u.email}?\n` +
+      `Saldo teraz: ${u.credit_balance || 0} kr (100 kr = $1).\n` +
+      `Liczba ujemna odejmuje - tak sie cofa pomylke.`,
+      '500');
+    if (raw === null) return;
+
+    const amount = parseInt(raw, 10);
+    // parseInt('abc') is NaN and parseInt('5x') is 5, hence checking both before
+    // firing a request that changes someone's balance.
+    if (!Number.isInteger(amount) || String(amount) !== raw.trim()) {
+      alert('Podaj liczbe calkowita kredytow.');
+      return;
+    }
+    if (amount === 0) return;
+
+    const description = prompt('Powod (trafi do historii uzytkownika):',
+                               'Korekta administratora');
+    if (description === null) return;
+
+    btn.disabled = true;
+    try {
+      const res = await apiFetch(`/admin/users/${u.id}/credits`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount, description: description || undefined }),
+      });
+      if (!res.ok) throw new Error(await errText(res));
+      const data = await res.json();
+      // Reload the whole table rather than patch one cell: a negative amount
+      // moves the "Wydano" column too.
+      await loadAdminUsers();
+      // An admin can top up their own account, which the topbar must reflect.
+      if (u.email === currentUser.email) setBalance(data.balance);
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
+      btn.disabled = false;
+    }
+  }
+
   async function loadAdminUsers() {
     adminUsers.innerHTML = '';
     let data;
@@ -1005,7 +1123,8 @@
       if (e.message !== 'UNAUTHORIZED') alert('Blad: ' + e.message);
       return;
     }
-    headerRow(adminUsers, ['Email', 'Rejestracja', 'Ostatnie logowanie', 'Joby', 'Koszt (szac.)', 'Konto', '']);
+    headerRow(adminUsers, ['Email', 'Rejestracja', 'Ostatnie logowanie', 'Joby',
+                           'Koszt (szac.)', 'Wydano (kr)', 'Saldo', 'Konto', '']);
     data.users.forEach(u => adminUsers.appendChild(renderAdminUserRow(u)));
   }
 
@@ -1021,7 +1140,13 @@
     cell(tr, fmtDate(u.created_at), 'nowrap');
     cell(tr, fmtDate(u.last_login_at), 'nowrap');
     cell(tr, u.job_count);
+    // Two numbers side by side on purpose: est_cost_usd is the planner's
+    // prediction, credits_spent is what the ledger actually took. They diverge
+    // exactly where the estimate was wrong — a failed scene, a retry, a job
+    // abandoned after planning.
     cell(tr, '$' + Number(u.est_cost_usd || 0).toFixed(2), 'nowrap');
+    cell(tr, u.credits_spent || 0, 'nowrap');
+    cell(tr, u.credit_balance || 0, 'nowrap amount-plus');
 
     const state = document.createElement('span');
     state.className = 'status-badge ' + (u.is_active ? 'done' : 'error');
@@ -1029,6 +1154,15 @@
     cell(tr, state);
 
     const actions = cell(tr, '');
+
+    // The only top-up path with STRIPE_ENABLED=false. Offered on one's own
+    // account too, unlike blocking, which an admin could not undo.
+    const topup = document.createElement('button');
+    topup.className = 'btn-link';
+    topup.textContent = 'Kredyty';
+    topup.onclick = () => adminGrantCredits(u, topup);
+    actions.appendChild(topup);
+
     // /auth/me carries no id, so "is this me" goes by email. The server
     // refuses self-blocking with a 409 either way.
     if (u.email !== currentUser.email) {
@@ -1067,6 +1201,116 @@
   });
   adminStatusFilter.addEventListener('change', loadAdminJobs);
 
+  // ------------------------------------------------------------ Credits ----
+
+  const CREDIT_TYPE_LABELS = {
+    purchase: 'Zakup', usage: 'Zuzycie', refund: 'Zwrot', bonus: 'Bonus',
+  };
+
+  async function refreshBalance() {
+    try {
+      const res = await apiFetch('/auth/me');
+      if (res.ok) setBalance((await res.json()).credit_balance);
+    } catch (_) {}
+  }
+
+  function renderPackages(packages, stripeEnabled) {
+    packagesList.innerHTML = '';
+    packagesOff.classList.toggle('hidden', stripeEnabled);
+    if (!stripeEnabled) return;
+
+    packages.forEach(pkg => {
+      const card = document.createElement('div');
+      card.className = 'package-card';
+
+      const label = document.createElement('div');
+      label.className = 'package-label';
+      label.textContent = pkg.label;
+      card.appendChild(label);
+
+      const credits = document.createElement('div');
+      credits.className = 'package-credits';
+      credits.textContent = pkg.credits + ' kredytow';
+      card.appendChild(credits);
+
+      const price = document.createElement('div');
+      price.className = 'package-price';
+      price.textContent = '$' + pkg.price_usd;
+      card.appendChild(price);
+
+      const btn = document.createElement('button');
+      btn.className = 'btn-success';
+      btn.textContent = 'Kup';
+      btn.addEventListener('click', () => buyPackage(pkg.id, btn));
+      card.appendChild(btn);
+
+      packagesList.appendChild(card);
+    });
+  }
+
+  async function buyPackage(packageId, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Przekierowanie...';
+    try {
+      const res = await apiFetch('/credits/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_id: packageId }),
+      });
+      if (!res.ok) throw new Error(await errText(res));
+      // Payment finishes on Stripe's page; the webhook grants the credits, not
+      // the user's return — closing the tab after paying loses nothing.
+      location.href = (await res.json()).url;
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') alert(e.message);
+      btn.disabled = false;
+      btn.textContent = 'Kup';
+    }
+  }
+
+  function renderCreditsHistory(entries) {
+    creditsHistory.innerHTML = '';
+    creditsHistoryEmpty.classList.toggle('hidden', entries.length > 0);
+    if (!entries.length) return;
+
+    headerRow(creditsHistory, ['Data', 'Typ', 'Zmiana', 'Saldo po', 'Opis']);
+    entries.forEach(e => {
+      const tr = document.createElement('tr');
+      cell(tr, fmtDate(e.created_at), 'nowrap');
+      cell(tr, CREDIT_TYPE_LABELS[e.type] || e.type, 'nowrap');
+      cell(tr, (e.amount > 0 ? '+' : '') + e.amount, e.amount > 0 ? 'nowrap amount-plus' : 'nowrap amount-minus');
+      cell(tr, e.balance_after, 'nowrap');
+      cell(tr, e.description || '-');
+      creditsHistory.appendChild(tr);
+    });
+  }
+
+  // The credits screen is reached from the topbar (anywhere) or from "Doladuj"
+  // on the plan, so "Wstecz" cannot lead to one fixed place — from "Moje filmy"
+  // it would otherwise return to an empty plan.
+  let screenBeforeCredits = 'screen-form';
+
+  async function loadCredits() {
+    const current = SCREEN_IDS.find(s => !document.getElementById(s).classList.contains('hidden'));
+    if (current && current !== 'screen-credits') screenBeforeCredits = current;
+    showScreen('screen-credits');
+    try {
+      const [pkgs, data] = await Promise.all([
+        adminGet('/credits/packages'),
+        adminGet('/credits'),
+      ]);
+      setBalance(data.balance);
+      renderPackages(pkgs.packages, pkgs.stripe_enabled);
+      renderCreditsHistory(data.history);
+    } catch (e) {
+      if (e.message !== 'UNAUTHORIZED') creditsHistoryEmpty.textContent = e.message;
+    }
+  }
+
+  btnCredits.addEventListener('click', loadCredits);
+  btnTopup.addEventListener('click', loadCredits);
+  btnCreditsBack.addEventListener('click', () => showScreen(screenBeforeCredits));
+
   btnAdmin.addEventListener('click', () => {
     showScreen('screen-admin');
     loadAdminJobs();
@@ -1090,6 +1334,15 @@
       if (res.ok) {
         currentUser = await res.json();
         userEmail.textContent = currentUser.email;
+        setBalance(currentUser.credit_balance);
+
+        // Back from Checkout. The webhook that grants the credits can arrive
+        // after this redirect, so the credits screen is more honest than a
+        // "topped up" message: it shows the actual state, whatever it is.
+        const paid = params.get('credits');
+        history.replaceState({}, '', location.pathname);
+        if (paid) { await loadCredits(); return; }
+
         showScreen('screen-form');
         return;
       }

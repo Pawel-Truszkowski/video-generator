@@ -9,7 +9,7 @@ from app.providers.base import ProviderError
 from app.providers.mock_provider import MockProvider
 from app.providers.fal_provider import FalProvider
 from app.services.ffmpeg import extract_last_frame
-from app.services.job_state import clip_path_for, clips_dir, frames_dir
+from app.services.job_state import clip_path_for, clips_dir, frames_dir, is_rendered
 
 SceneDone = Callable[[int, str], Awaitable[None]]
 SceneError = Callable[[int, str], Awaitable[None]]
@@ -64,19 +64,10 @@ async def generate_clips(
         """True when scene `idx` needs no provider call.
 
         Called before the semaphore is taken, so skipped scenes do not consume
-        a concurrency slot.
+        a concurrency slot. The rule itself lives in job_state.is_rendered():
+        the API layer asks the same question to price a resume or a retry.
         """
-        scene = scenes[idx]
-        out_path = clip_path_for(job_id, idx)
-
-        if scene.get("status") != "done":
-            return False
-        # The disk gets the final word. `scene["clip_path"]` is deliberately not
-        # consulted: older rows point at a uuid name that stitch would never find.
-        if not os.path.exists(out_path):
-            return False
-        # A crashed download or a killed ffmpeg leaves a 0-byte file behind.
-        return os.path.getsize(out_path) > 0
+        return is_rendered(job_id, idx, scenes[idx])
 
     async def generate_single(idx: int, input_image: str) -> str:
         scene = scenes[idx]

@@ -394,23 +394,90 @@ rekordow do DNS domeny, a `cytr.us` nalezy do Mikrusa.
 
 ### Kroki
 
-1. **Kup domene** (~40-60 zl/rok). Cloudflare Registrar / Porkbun / OVH / nazwa.pl —
-   obojetne, byle byl dostep do edycji rekordow DNS.
-2. **Resend → Domains → Add Domain.** Warto podac **subdomene** do wysylki, np.
-   `mail.twoja-domena.pl`, a nie domene glowna: gdyby reputacja nadawcy kiedys
-   ucierpiala, nie pociagnie za soba twojej poczty firmowej.
-3. **Wklej wygenerowane rekordy do DNS.** Resend poda komplet:
-   - `TXT` z kluczem **DKIM** (`resend._domainkey...`) — podpis kryptograficzny maila
-   - `TXT` ze **SPF** (`v=spf1 include:amazonses.com ~all`) — kto moze wysylac w twoim imieniu
-   - `MX` — obsluga odbic (bounce)
-   - opcjonalnie `DMARC` — warto dodac, poprawia dostarczalnosc
-4. **Poczekaj i kliknij Verify.** Propagacja DNS to zwykle minuty, czasem godziny.
-   Dopoki Resend nie pokaze `Verified`, nie ruszaj dalej.
+Domena uzywana w tym wdrozeniu: **`ai-video-generator.pl`** (rejestrator: nazwa.pl).
+Sluzy *wylacznie* do wysylki maili — aplikacja zostaje pod `ai-video-generator.cytr.us`,
+`BASE_URL` sie **nie zmienia**.
+
+1. ~~**Kup domene**~~ — ZROBIONE (`ai-video-generator.pl`).
+2. **Resend → Domains → Add Domain: `mail.ai-video-generator.pl`.** Celowo
+   **subdomena**, nie domena glowna: gdyby reputacja nadawcy kiedys ucierpiala,
+   nie pociagnie za soba poczty na `@ai-video-generator.pl`, gdybys ja kiedys zalozyl.
+   Przy dodawaniu wybierasz **region** (np. `eu-west-1`) — wchodzi on do nazw
+   rekordow, wiec pozniejsza zmiana regionu = ponowna weryfikacja.
+3. **Wklej wygenerowane rekordy do DNS.** Ponizej ksztalt tego, co Resend daje
+   dla domen zakladanych **po sierpniu 2026**; **wartosci zawsze kopiuj z panelu
+   Resend**, nie stad:
+
+   | Typ | Host (pelny) | Wartosc |
+   |---|---|---|
+   | `TXT` | `resend._domainkey.mail.ai-video-generator.pl` | `p=MIGfMA0GCSq...` (DKIM, ~400 znakow) |
+   | `CNAME` | `send.mail.ai-video-generator.pl` | `send.forge.rmta.net` |
+   | `CNAME` | `rsend.mail.ai-video-generator.pl` | `rsend-euw1.forge.rmta.net` |
+   | `TXT` | `_dmarc.mail.ai-video-generator.pl` | `v=DMARC1; p=none;` (opcjonalny, poprawia dostarczalnosc) |
+
+   Starsze konta dostawaly zamiast dwoch CNAME-ow rekord `MX` + `TXT` ze SPF na
+   `amazonses.com` — jesli panel Resend pokazuje taki komplet, kieruj sie nim.
+   **Kazdy CNAME weryfikuje sie osobno**, wiec przy jednym poprawnym domena potrafi
+   utknac w stanie `partially_verified`.
+
+   **Gdzie to jest w nazwa.pl.** Zakladka nie nazywa sie "Rekordy DNS":
+   `nazwa.pl/panel` → **Uslugi → Domeny** → przy domenie, po **prawej**, maly
+   odnosnik **`konfiguruj`** → zakladka **"Reczna konfiguracja DNS"**. Lista
+   rekordow jest widoczna od razu, ale **tylko do odczytu** — edycje odblokowuje
+   przycisk **`ZMIEN`** na samym **dole** listy. To miejsce, w ktorym najlatwiej
+   utknac: wyglada, jakby nic nie dalo sie kliknac.
+
+   Gdy w ogole nie ma `konfiguruj` / recznej konfiguracji, sprawdz dwie rzeczy:
+   czy domena nie jest delegowana na obce serwery NS (wtedy strefa jest gdzie
+   indziej i edycja w nazwa.pl nic nie da) oraz czy reczna konfiguracja strefy
+   jest w ogole wlaczona — nazwa.pl trzyma to za osobnym przelacznikiem.
+
+   **Pulapka 1 — "Niedozwolony wpis w nazwie".** Panel nazwa.pl wymaga w polu
+   nazwy **pelnej nazwy (FQDN)**, a nie czesci wzglednej: `send.mail.ai-video-generator.pl`,
+   nie `send.mail`. Skrocona nazwa konczy sie bledem *Niedozwolony wpis w nazwie* —
+   komunikat znaczy dokladnie tyle, ze wpisana nazwa nie nalezy do tej strefy.
+   To odwrotnie niz w wiekszosci paneli (Cloudflare, OVH), ktore sufiks domeny
+   dokladaja same — stad latwo tu wpasc.
+
+   Objaw bywa mylacy, bo walidacja **TXT jest lagodniejsza niz CNAME**: ten sam
+   komplet od Resenda potrafi przejsc w czesci (DKIM `wykonany`) i wywalic sie
+   na obu CNAME-ach, mimo ze wszystkie trzy wpisy sa przepisane poprawnie.
+   Zanim zaczniesz szukac winy w rekordach, sprawdz na liscie, jak rekord
+   *naprawde* sie nazywa.
+
+   **Czego NIE trzeba ruszac.** Swieza strefa zawiera `*.ai-video-generator.pl` (A)
+   oraz `mail.ai-video-generator.pl` (A) — wpisy nazwa.pl pod wlasny hosting.
+   Zaden z nich nie blokuje CNAME-ow Resenda: `mail...` i `send.mail...` to dwie
+   rozne nazwy, wiec zakaz wspolistnienia CNAME z innymi rekordami ich nie dotyczy
+   (a `mail...` i tak nie daje sie usunac). Na pustej domenie wildcard mozna
+   skasowac dla higieny, ale to nie jest lekarstwo na nic.
+
+   **Cudzyslowy przy TXT sa zbedne** — panel doklada je sam przy zapisie do strefy.
+   Klucz DKIM (~400 znakow) wklej jednym ciagiem, bez spacji i bez lamania linii;
+   nazwa.pl przyjmuje go bez protestu.
+
+   **Gdy panel jednak odrzuci DKIM**: przenies **samo DNS** do Cloudflare — domena
+   zostaje w nazwa.pl, zmieniasz tylko serwery nazw. Rekordy dodaje sie wtedy bez
+   walki, a propagacja jest w sekundach zamiast godzin.
+4. **Poczekaj i kliknij Verify.** Propagacja to zwykle minuty, czasem godziny.
+   Sprawdzenie z wlasnego terminala, zanim zaczniesz klikac Verify w kolko:
+   ```bash
+   dig +short TXT   resend._domainkey.mail.ai-video-generator.pl
+   dig +short CNAME send.mail.ai-video-generator.pl
+   dig +short CNAME rsend.mail.ai-video-generator.pl
+   ```
+   Odpowiedz `send.forge.rmta.net.ai-video-generator.pl.` znaczy, ze panel dokleil
+   nazwe domeny takze do **wartosci** CNAME — zakoncz ja wtedy kropka
+   (`send.forge.rmta.net.`), ktora oznacza nazwe absolutna.
+   Pusta odpowiedz = rekord jeszcze nie propagowal **albo** ma zla nazwe (patrz
+   pulapka wyzej). Dopoki Resend nie pokaze `Verified`, nie ruszaj dalej.
 5. **Na VPS, w `.env`:**
    ```bash
-   MAIL_FROM=Video Generator <no-reply@mail.twoja-domena.pl>
+   MAIL_FROM=Video Generator <no-reply@mail.ai-video-generator.pl>
    ```
    Adres **musi** byc w zweryfikowanej domenie. Inny → Resend odrzuca zadanie.
+   `no-reply@` jest tu swiadome: skrzynka nie istnieje i nikt nie czyta odpowiedzi,
+   a rekord MX z punktu 3 obsluguje wylacznie odbicia dla Resenda.
 6. **Odtworz kontener** — `up -d`, a **nie** `restart`:
    ```bash
    docker compose -f docker-compose.prod.yml up -d

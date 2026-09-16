@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A working proof-of-concept (not the "VideoAI Studio" SaaS spec from the parent directory's docs) that turns a set of uploaded images + a text prompt into a stitched MP4. Single FastAPI container, SQLite, magic-link auth, no payments — see `docs/roadmap.md` for what's explicitly deferred (credits/Stripe, admin panel, S3 storage, Celery/Redis queue, disk cleanup) and `docs/changelog.md` for what each version shipped.
+A working proof-of-concept (not the "VideoAI Studio" SaaS spec from the parent directory's docs) that turns a set of uploaded images + a text prompt into a stitched MP4. Single FastAPI container, SQLite, magic-link auth, a credit ledger with Stripe top-ups — see `docs/roadmap.md` for what's explicitly deferred (credits/Stripe, admin panel, S3 storage, Celery/Redis queue, disk cleanup) and `docs/changelog.md` for what each version shipped.
 
 ## Commands
 
@@ -89,6 +89,66 @@ Four rules that fall out of that, and are easy to break:
    would `await` right there and let a double-click past the limit.
 7. **A `planned` job never resumes into generation by itself.** `_decide_stage()` returns `planning`/`planned`/`generating`/`done`; only the first and third start a task, because pressing *Generuj* is what spends money. A job that failed on one scene resumes as `generating`, not `planning` — replanning calls `save_scenes`, which is DELETE+INSERT and would drop paid-for clips. For the same reason plan edits are rejected with 409 once any scene has `status='done'`, not just on job status.
 
+### Credits (roadmap Faza 3, shipped in 0.7.0)
+
+1 credit = 1 cent USD, always an integer. Rates are **derived** from
+`settings.model_costs` × `CREDIT_MARGIN` in `credits.credit_rate()` — there is no
+second table of prices, because it would drift from fal.ai's the first time their
+pricing changes. Note `ceil(round(x, 6))`, not bare `ceil()`: `0.07 * 100 * 2.0`
+is `14.000000000000002` in floating point, which rounded Kling up by a full credit.
+
+Six rules that are easy to break:
+
+1. **`users.credit_balance` is authoritative; `SUM(credits.amount)` is an audit
+   trail.** This is the opposite of the parent directory's spec and it follows
+   from `app/db.py`: one shared aiosqlite connection, no explicit transactions,
+   every function committing on its own. Only a single SQL statement is atomic
+   here, so a charge is `UPDATE users SET credit_balance = credit_balance - ?
+   WHERE id = ? AND credit_balance >= ? RETURNING credit_balance` — no row
+   returned means no funds. `SELECT SUM` then `INSERT` is the same TOCTOU window
+   `_assert_slot_free` and `consume_magic_token` both avoid.
+2. **`app/services/credits.py` is the only module that writes either of them.**
+   `grant()` and `try_charge()` update the balance and append the ledger row
+   together. Note the orderings differ on purpose: `try_charge` updates first
+   (the CAS *is* the check), `grant` inserts first, because `INSERT OR IGNORE` on
+   `UNIQUE(ext_id)` is what makes a repeated Stripe webhook a no-op — with the
+   balance moving first, the duplicate would already have been paid.
+3. **A job's whole accounting derives from ledger rows carrying its `job_id`.**
+   `refund = -SUM(amount WHERE job_id) - credits_for(model, scenes done)`. It is
+   idempotent (a second call yields 0) and needs no separate reservation state,
+   which is what makes retry and resume work: each adds its own `usage`.
+4. **`settle_job()` is called from `finally`, never `except Exception`.**
+   `asyncio.CancelledError` inherits from `BaseException`, so the existing
+   handler in `run_generation` does not catch a container shutdown — the single
+   most likely moment for a reservation to vanish. `reconcile_interrupted()` (now
+   returning ids, not a count) is the second net, settling what died with the
+   previous process; idempotency is why both can fire on the same job.
+5. **Charging happens in the handler, before `_start()`** — not inside it, even
+   though `_start` is the one gate every task passes. `_start` is synchronous by
+   design (see the comment on `_assert_slot_free`) and a DB write needs `await`.
+   In `retry_scene` the charge must come **before** the clip is deleted, for the
+   same reason the slot check does.
+6. **Resume and retry price only what is missing**, via
+   `job_state.is_rendered()` — the same function `generate_clips` uses to skip
+   scenes. Charging the full plan would bill a second time for clips already on
+   disk.
+
+Stripe runs on `httpx` with no SDK (`app/services/stripe_client.py`), like
+`app/mail/resend_sender.py`. Two things to keep in mind: the webhook lives on its
+**own router without `require_user`** (Stripe sends no session cookie; the HMAC
+signature is the authentication), and the signature is computed over the **raw
+request body** — call `await request.body()` before anything parses JSON. Credit
+amounts come from our own package table by `metadata[package_id]`, never from the
+payload's `amount_total`. `STRIPE_ENABLED=false` by default, so local work needs
+no Stripe account; admins top accounts up through
+`POST /admin/users/{id}/credits`.
+
+Scene `duration_s` is an allowlist (`settings.allowed_durations`) in **both**
+`/scenes/{idx}/update` and `SceneItem`, and LLM-authored plans go through
+`_sanitize_plan()`. These are not tidiness: `duration_s` is the only dimension of
+price, a negative one reserves a negative amount — that is, it credits the
+account — and the user's prompt reaches the planner verbatim.
+
 ### Data retention (roadmap Faza 1.3, shipped in 0.5.0)
 
 `cleanup.retention_loop()` is started in `lifespan` (`app/main.py`) — an asyncio
@@ -123,7 +183,7 @@ All runtime settings are one frozen dataclass, `settings = Settings()` in `app/c
 
 ### Frontend
 
-`app/static/` is plain HTML/CSS/vanilla JS (no build step, no framework) served directly by FastAPI's `StaticFiles` mount at `/`. Five mutually exclusive screens driven by `app.js`, toggled only through `showScreen()`: login → upload form → scene plan editor (cost/duration recompute client-side-triggered via `/scenes/sync` and `/scenes/{idx}/update`) → progress screen consuming the SSE stream from `/jobs/{id}/events`, plus a "Moje filmy" list. The editor holds no `File` objects after a reload, so it rebuilds its thumbnails from `GET /jobs/{id}/images/{index}` and its picker from `image_count` in `GET /jobs/{id}`. `resumeJob()` subscribes to SSE *before* calling `/resume`, so an early event can't be missed.
+`app/static/` is plain HTML/CSS/vanilla JS (no build step, no framework) served directly by FastAPI's `StaticFiles` mount at `/`. Seven mutually exclusive screens driven by `app.js`, toggled only through `showScreen()`: login → upload form → scene plan editor (duration is recomputed client-side; the **cost is not** — `/scenes/sync` and `/scenes/{idx}/update` return `credits_cost` and the editor displays that number. Until 0.7.0 `app.js` kept its own copy of the price table and showed the wrong model's rate after a resume) → progress screen consuming the SSE stream from `/jobs/{id}/events`, plus a "Moje filmy" list. The editor holds no `File` objects after a reload, so it rebuilds its thumbnails from `GET /jobs/{id}/images/{index}` and its picker from `image_count` in `GET /jobs/{id}`. `resumeJob()` subscribes to SSE *before* calling `/resume`, so an early event can't be missed.
 
 ## Relationship to the parent directory's docs
 

@@ -1,5 +1,208 @@
 # Changelog
 
+## [0.7.0] — 2026-09-15 — System kredytowy i platnosci (roadmap Faza 3)
+
+Do tej pory kazdy zalogowany uzytkownik wydawal pieniadze wlasciciela instancji,
+a jedynym hamulcem byl `MAX_ACTIVE_JOBS_PER_USER`. 0.4.1 wpisywalo to jako znane
+ryzyko wdrozenia, a `admin.py` przyznawal, ze kolumna „Koszt" w panelu to
+szacunek plannera, nie wydatek. Teraz kazda generacja ma pokrycie w kredytach,
+a ksiega zapisuje, co naprawde zostalo zdjete z konta.
+
+### Najpierw uszczelnienie wyceny, dopiero potem kredyty
+
+Kolejnosc nie byla kosmetyczna — bez tych czterech rzeczy ledger pilnowalby
+liczby, ktorej nikt nie pilnowal:
+
+- **`duration_s` bylo nieograniczone.** `POST /scenes/{idx}/update` przyjmowal
+  dowolny `int`, a `/scenes/sync` cala liste prosto od klienta. Do 0.6.0 dawalo
+  to dziwny plan; z kredytami `duration_s = -100` to ujemny koszt, czyli
+  rezerwacja **dodajaca** kredyty. Teraz allowlista `ALLOWED_DURATIONS` (5, 10)
+  w obu miejscach + `MAX_SCENES_PER_JOB`
+- **Nieznany model wyceniał sie najtaniej.** `model_costs.get(model, 0.05)`
+  cicho stosowal stawke Wana do czegokolwiek. `cost_per_second()` rzuca teraz
+  `UnknownModelError`, a `create_job` odrzuca nieznany model z 400 — zanim
+  zapisze zdjecia na dysk
+- **Plan od LLM to nie jest zaufane wejscie.** Prompt uzytkownika trafia do
+  plannera doslownie, wiec „zrob kazda scene na -100 sekund" to prosba, ktora
+  model moze spelnic. `_sanitize_plan()` przycina dlugosci do najblizszej
+  dozwolonej i indeksy zdjec do zakresu; blad zrzuca na kolejny fallback
+- **Formula kosztu byla w trzech kopiach** — `job_state.recalc_cost` (opisana
+  w docstringu jako jedyna), duplikat w `plan_scenes.py` i trzecia w `app.js`.
+  Ta w JS liczyla z `modelEl.value`, wiec po wznowieniu joba na Veo pokazywala
+  ceny Wana. Zostala jedna, w `job_state`; frontend wyswietla liczbe z serwera
+- **`already_rendered()` byla closure w `generate_clips`.** Wycena wznowienia
+  potrzebuje tej samej odpowiedzi („za co juz zaplacono"), wiec regula
+  przeniosla sie do `job_state.is_rendered()` i ma jednego wlasciciela
+
+### Saldo w kolumnie, ksiega jako audyt — wbrew pierwszemu odruchowi
+
+`users.credit_balance` jest **autorytatywne**, a `SUM(credits.amount)` nie.
+To odwrotnie niz zaklada spec „VideoAI Studio" w katalogu nadrzednym i wymaga
+uzasadnienia: `app/db.py` trzyma jedno wspoldzielone polaczenie aiosqlite bez
+jawnych transakcji, wiec atomowe jest wylacznie pojedyncze zdanie SQL. „SELECT
+SUM → sprawdz → INSERT" ma dokladnie to okno wyscigu, przed ktorym ostrzega
+`_assert_slot_free` i ktore zamyka `consume_magic_token`.
+
+```sql
+UPDATE users SET credit_balance = credit_balance - ?
+ WHERE id = ? AND credit_balance >= ? RETURNING credit_balance
+```
+
+Brak wiersza w `RETURNING` = nie bylo pokrycia. Zweryfikowane 20 rownoleglymi
+obciazeniami po 100 przy saldzie 1000: udalo sie dokladnie 10, saldo skonczylo
+na zerze i ani razu nie zeszlo ponizej.
+
+Tabela `credits` jest append-only: historia dla uzytkownika, podstawa
+rozliczenia joba i — przez `UNIQUE(ext_id)` — idempotencja doladowan.
+
+### Rezerwacja z gory, zwrot po fakcie
+
+Roadmap zakladala pobor **po** ukonczeniu generacji, zeby nie brac za nieudane.
+Intencja zostala, mechanizm nie: miedzy sprawdzeniem salda a koncem generacji
+mija kilkanascie minut, w ktorych nic nie pilnuje budzetu. Zamiast tego wpis
+`usage` na pelny szacunek przy starcie i `refund` za to, co nie powstalo.
+
+Cala ksiegowosc joba wynika z wpisow z jego `job_id`, bez osobnego stanu
+rezerwacji:
+
+```
+spent_net = -SUM(amount WHERE job_id = ?)
+actual    = credits_for(model, sceny ze status='done')
+refund    = spent_net - actual
+```
+
+Formula jest idempotentna, wiec `settle_job()` mozna wolac wielokrotnie — i sama
+obsluguje retry oraz wznowienie, bo kazde z nich dokłada wlasny `usage`.
+Sprawdzone: job na 6 scen, rezerwacja 600, restart w polowie, zwrot 600,
+wznowienie, rezerwacja 600 ponownie, film gotowy — netto 600 za 6 scen.
+
+### `settle_job` w `finally`, nie w `except`
+
+`asyncio.CancelledError` dziedziczy z `BaseException`, wiec `except Exception`
+w `run_generation` **nie lapie** zamkniecia kontenera — a to najczestszy moment,
+w ktorym rezerwacja mialaby przepasc. W logach widac, ze zwrot wykonuje sie
+miedzy „Shutting down" a startem nowego procesu, czyli wlasnie tam.
+
+Drugi bezpiecznik: sweep startowy. `reconcile_interrupted()` zwraca teraz liste
+id zamiast liczby wierszy, a `lifespan` rozlicza kazdy z nich. Idempotencja
+sprawia, ze oba mechanizmy moga zadzialac na tym samym jobie bez kolizji.
+
+Blad samego rozliczenia jest polykany i logowany: wyjatek z `finally`
+przykrylby prawdziwy blad generacji i zamienil czytelna awarie w blad ksiegowy.
+
+### Gdzie rezerwacja, a gdzie nie
+
+| Sciezka | Kwota |
+|---|---|
+| `POST /jobs/{id}/generate` | wszystkie sceny bez gotowego klipu |
+| `POST /jobs/{id}/resume` (stage `generating`) | tylko sceny nie-`is_rendered` |
+| `POST /jobs/{id}/scenes/{idx}/retry` | ta jedna scena |
+| `POST /jobs/{id}/plan` | brak — planowanie to ulamek centa u LLM |
+
+Obciazenie idzie **w handlerze, przed `_start()`**, a nie w samym `_start()`,
+mimo ze to jedyna brama kazdego taska: `_start` jest synchroniczne swiadomie,
+a zapis do bazy wymaga `await`. Wyscigu i tak nie ma, bo `try_charge` rozstrzyga
+wszystko jednym zdaniem SQL.
+
+W `retry_scene` obciazenie stoi **przed** skasowaniem klipu — z tego samego
+powodu, co sprawdzenie limitu jobow: odmowa po wyczyszczeniu sceny zostawilaby
+ja skasowana i nic biegnacego, co by ja odtworzylo.
+
+### Stripe bez SDK
+
+`app/services/stripe_client.py` na `httpx`, jak `resend_sender.py`. Biblioteka
+`stripe` ciagnie wlasne zaleznosci, a `pip install` jest najbardziej
+pamieciozernym momentem deployu na 1 GB RAM.
+
+- **Webhook ma wlasny router**, bez `require_user`: Stripe nie wysyla ciasteczka
+  sesji, wiec trasa na routerze `jobs` konczylaby kazde doladowanie 401-ka.
+  Uwierzytelnieniem jest podpis HMAC-SHA256 — repo mialo juz ten wzorzec
+  w `auth/tokens.py`
+- Podpis liczony z **surowych bajtow** (`await request.body()` przed jakimkolwiek
+  `.json()`): ponowna serializacja zmienia biale znaki i nic sie nigdy nie zgadza
+- Tolerancja 300 s na timestamp — bez niej przechwycone zadanie da sie odtwarzac
+  bez konca
+- Liczba kredytow z **wlasnego cennika po `metadata[package_id]`**, nigdy
+  z `amount_total` w payloadzie. O wysokosci doladowania decyduje serwer
+- Webhook zwraca 200 takze dla zdarzen nieobslugiwanych i dla duplikatu; kazdy
+  inny kod Stripe traktuje jako awarie i ponawia przez kolejne doby. 400 zostaje
+  wylacznie dla zlego podpisu
+- `STRIPE_ENABLED=false` domyslnie, jak `MOCK_PROVIDER=true`: lokalny development
+  nie moze wymagac konta u dostawcy platnosci
+
+Zweryfikowane dziewiecioma przypadkami, w tym: to samo zdarzenie dwa razy (drugi
+raz `duplicate`, saldo bez zmian), zly sekret, podpis sprzed 9999 s, podmienione
+cialo przy poprawnym podpisie, sesja nieoplacona.
+
+### Kredyty powitalne
+
+`WELCOME_CREDITS` (500 = $5), przyznawane przez `sync_welcome_credits()`
+idempotentnie po `ext_id = "welcome:<user_id>"`. Ta sama zasada co `sync_admins()`:
+wynik zalezy od env, nie od historii bazy. Konta sprzed 0.7.0 lapie
+`backfill_welcome_credits()` w `lifespan` — 9 kont przy pierwszym starcie,
+drugi start nie dosypal.
+
+Konsekwencja swiadoma: podniesienie `WELCOME_CREDITS` **nie** dosypuje roznicy
+istniejacym kontom, bo wpis juz istnieje.
+
+Migracja `users.credit_balance` nie robi backfillu (zero + osobna funkcja),
+zeby schemat nie decydowal o polityce cenowej.
+
+### Zaokraglenie, ktore kosztowalo 7%
+
+`credit_rate()` liczy stawke z `model_costs` razy marza, a nie z drugiej tabeli
+stawek — ta rozjechalaby sie z cennikiem fal.ai przy pierwszej jego zmianie.
+Pierwsza wersja robila samo `ceil()` i wyceniala Klinga na 15 kr/s zamiast 14,
+bo `0.07 * 100 * 2.0` to w zmiennoprzecinkowym `14.000000000000002`. Teraz
+`ceil(round(x, 6))`: prawdziwe pol kredyta dalej idzie w gore, artefakt
+reprezentacji nie.
+
+Stawki przy `CREDIT_MARGIN=2.0`: Wan 10 kr/s, Kling 14, Veo 20.
+
+### UI
+
+- Saldo w topbarze (z `/auth/me`, ktore frontend i tak wola przy bootstrapie)
+- Ekran planu: „Ten film zuzyje X kredytow (masz Y)". Gdy brakuje, `Generuj`
+  **znika** na rzecz `Doladuj` — ten sam wzorzec, co ukrywanie `Wznow` przy
+  `files_purged`: nie pokazuj przycisku, ktory serwer i tak odrzuci. 402 zostaje
+  jako zabezpieczenie, bo saldo mogl w miedzyczasie zjesc inny job
+- 402 na `/generate` **wraca na ekran planu**, nie zostawia uzytkownika na ekranie
+  postepu z czerwonym bledem i niczym do klikniecia
+- Siodmy ekran `screen-credits`: pakiety i historia. „Wstecz" wraca tam, skad
+  sie przyszlo — wejscie jest i z topbaru, i z planu
+- Nowe zdarzenie SSE `credits` z kwota zwrotu i saldem; emitowane z `finally`,
+  wiec przychodzi takze po bledzie generacji
+- `Wznow` jest wylaczony przy saldzie 0. Dokladny koszt dokonczenia zalezy od
+  tego, ktore klipy leza na dysku, a lista jobow tego nie wie — zero jest jednak
+  jednoznaczne. Przy saldzie dodatnim decyzje podejmuje serwer (402 z kwota)
+
+### Panel admina
+
+- `GET /admin/users` pokazuje saldo i **`credits_spent` z ksiegi** obok
+  dotychczasowego `est_cost_usd`. Dwie liczby celowo: rozjezdzaja sie dokladnie
+  tam, gdzie szacunek byl zly — nieudana scena, retry, job porzucony po planowaniu.
+  Dwa osobne agregaty, nie jeden `SELECT` z dwoma `LEFT JOIN`: laczenie `jobs`
+  i `credits` naraz mnozy wiersze i obie sumy wychodza zle
+- `POST /admin/users/{id}/credits` — reczne doladowanie, jedyna droga przy
+  `STRIPE_ENABLED=false`. Ujemna kwota dozwolona celowo: bez niej nie da sie
+  cofnac pomylki ani zejsc kontem do zera przy testowaniu blokady. Bez `ext_id`,
+  bo to jednorazowa decyzja czlowieka — dwa doladowania po 100 maja dac 200
+- W tabeli kont: kolumny **Wydano (kr)** i **Saldo** oraz przycisk **Kredyty**
+  pytajacy o kwote i powod (powod trafia do historii uzytkownika). Dostepny takze
+  na wlasnym koncie admina — inaczej niz blokada, ktorej admin nie moze zalozyc
+  sobie samemu, bo nie mialby jak jej cofnac. Po udanej zmianie przeladowywana
+  jest cala tabela, nie jedna komorka: ujemna kwota rusza tez kolumne „Wydano"
+
+### Czego tu nie ma
+
+- **Faktur i VAT-u.** Stripe zbiera platnosc, nic nie wystawia dokumentu
+- **Wygasania kredytow** ani zwrotu pieniedzy (tylko kredytow)
+- Kredyty nie pokrywaja kosztu LLM przy planowaniu — jest darmowe
+- Rzeczywisty koszt u fal.ai przy retry to do 3x stawka sceny
+  (`clip_max_retries = 2`), a uzytkownik placi 1x. Marza ma to pokryc
+- `PRAGMA foreign_keys` nadal wylaczone, wiec `credits.user_id REFERENCES users`
+  jest dekoracyjne — jak reszta kluczy obcych w tym schemacie
+
 ## [0.6.0] — 2026-09-14 — Panel admina (roadmap Faza 2.3)
 
 Pierwszy widok na dane wszystkich uzytkownikow. Do tej pory jedyna droga do
