@@ -47,6 +47,9 @@ Request flow:
 
 ```
 POST /jobs                 → save images to disk, INSERT jobs row (status=uploaded)
+POST /jobs (plan_mode=manual, scenes=JSON)
+                           → validate plan → save images → validate() → INSERT
+                              → save_scenes → status=planned (no /plan, no LLM)
 POST /jobs/{id}/plan       → asyncio.create_task(run_planning): validate → plan_scenes
                               (status becomes 'planned', pipeline pauses for user approval)
 POST /jobs/{id}/generate   → asyncio.create_task(run_generation): generate_clips → stitch
@@ -88,6 +91,7 @@ Four rules that fall out of that, and are easy to break:
    check and the insert in `_start()`; a `SELECT COUNT(*)` over the active statuses
    would `await` right there and let a double-click past the limit.
 7. **A `planned` job never resumes into generation by itself.** `_decide_stage()` returns `planning`/`planned`/`generating`/`done`; only the first and third start a task, because pressing *Generuj* is what spends money. A job that failed on one scene resumes as `generating`, not `planning` — replanning calls `save_scenes`, which is DELETE+INSERT and would drop paid-for clips. For the same reason plan edits are rejected with 409 once any scene has `status='done'`, not just on job status.
+8. **A `plan_mode='manual'` job never reaches `run_planning`** (0.8.0). Its scenes are written by `create_job`, so `_decide_stage()` never answers `planning` for it; `/plan` returns 409 and `/resume` of a manual job with no scenes returns 409 instead of calling the LLM. `plan_mode` also decides what `jobs.prompt` means: a style appended to every scene by `job_state.scene_prompt()` (manual) or the film description the planner consumed (auto, never appended). A continuation scene (`chain_from_prev=true`) ignores its own `image_index` — the UI greys it out rather than pretending the image is used.
 
 ### Credits (roadmap Faza 3, shipped in 0.7.0)
 
@@ -183,7 +187,7 @@ All runtime settings are one frozen dataclass, `settings = Settings()` in `app/c
 
 ### Frontend
 
-`app/static/` is plain HTML/CSS/vanilla JS (no build step, no framework) served directly by FastAPI's `StaticFiles` mount at `/`. Seven mutually exclusive screens driven by `app.js`, toggled only through `showScreen()`: login → upload form → scene plan editor (duration is recomputed client-side; the **cost is not** — `/scenes/sync` and `/scenes/{idx}/update` return `credits_cost` and the editor displays that number. Until 0.7.0 `app.js` kept its own copy of the price table and showed the wrong model's rate after a resume) → progress screen consuming the SSE stream from `/jobs/{id}/events`, plus a "Moje filmy" list. The editor holds no `File` objects after a reload, so it rebuilds its thumbnails from `GET /jobs/{id}/images/{index}` and its picker from `image_count` in `GET /jobs/{id}`. `resumeJob()` subscribes to SSE *before* calling `/resume`, so an early event can't be missed.
+`app/static/` is plain HTML/CSS/vanilla JS (no build step, no framework) served directly by FastAPI's `StaticFiles` mount at `/`. Seven mutually exclusive screens driven by `app.js`, toggled only through `showScreen()`: login → upload form → scene plan editor (duration is recomputed client-side; the **cost is not** — `/scenes/sync` and `/scenes/{idx}/update` return `credits_cost` and the editor displays that number. Until 0.7.0 `app.js` kept its own copy of the price table and showed the wrong model's rate after a resume) → progress screen consuming the SSE stream from `/jobs/{id}/events`, plus a "Moje filmy" list. The editor holds no `File` objects after a reload, so it rebuilds its thumbnails from `GET /jobs/{id}/images/{index}` and its picker from `image_count` in `GET /jobs/{id}`. `resumeJob()` subscribes to SSE *before* calling `/resume`, so an early event can't be missed. Scene cards on both the upload form (manual-mode draft, local only) and the plan editor (synced) come from one renderer, `renderSceneCards(container, scenes, opts)` — change the card there, not in two places.
 
 ## Relationship to the parent directory's docs
 

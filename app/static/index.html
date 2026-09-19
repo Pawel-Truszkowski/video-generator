@@ -45,6 +45,14 @@
     <!-- SCREEN 1: Upload form -->
     <div id="screen-form" class="hidden">
       <div class="form-group">
+        <label>Tryb</label>
+        <div class="mode-switch">
+          <label><input type="radio" name="plan-mode" value="manual" checked> Sceny recznie</label>
+          <label><input type="radio" name="plan-mode" value="auto"> Planer AI</label>
+        </div>
+      </div>
+
+      <div class="form-group">
         <label>Zdjecia</label>
         <div class="dropzone" id="dropzone">
           <p>Przeciagnij zdjecia lub kliknij aby wybrac</p>
@@ -53,8 +61,14 @@
         <div class="previews" id="previews"></div>
       </div>
 
+      <div class="form-group" id="draft-group">
+        <label>Sceny</label>
+        <div id="draft-scenes"></div>
+        <div id="draft-warning" class="draft-warning hidden"></div>
+      </div>
+
       <div class="form-group">
-        <label>Opis filmu</label>
+        <label id="prompt-label">Opis filmu</label>
         <textarea id="prompt" placeholder="Opisz jaki film chcesz wygenerowac..."></textarea>
       </div>
 
@@ -67,7 +81,7 @@
             <option value="veo-3.1-fast">Veo 3.1 Fast (~$0.10/s)</option>
           </select>
         </div>
-        <div class="form-group">
+        <div class="form-group" id="duration-group">
           <label>Dlugosc: <span id="duration-label">60s</span></label>
           <input type="range" id="duration" min="10" max="180" step="5" value="60">
         </div>

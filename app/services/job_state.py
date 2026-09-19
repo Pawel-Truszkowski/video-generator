@@ -127,6 +127,28 @@ def recalc_cost(model: str, scenes: list[dict]) -> float:
     return round(sum(s["duration_s"] for s in scenes) * cost_per_second(model), 2)
 
 
+# --- Provider prompt ----------------------------------------------------------
+
+# fal.ai endpoints cap the prompt somewhere between 2000 and 2500 characters,
+# depending on the model; the lower bound keeps every one of them happy.
+MAX_PROVIDER_PROMPT = 2000
+
+
+def scene_prompt(sub_prompt: str, style: str) -> str:
+    """The prompt a provider receives for one scene.
+
+    `style` is the job-wide style of a manual plan ('' for an LLM plan, whose
+    `jobs.prompt` is a film description, not something to repeat per scene).
+    Appended rather than prepended: video models weight the start of the prompt
+    most, and the scene's own motion is what differs between clips.
+    """
+    sub_prompt = (sub_prompt or "").strip()
+    style = (style or "").strip()
+    if not style:
+        return sub_prompt[:MAX_PROVIDER_PROMPT]
+    return f"{sub_prompt.rstrip('. ')}. {style}"[:MAX_PROVIDER_PROMPT]
+
+
 # --- Rendered-clip check ------------------------------------------------------
 
 def is_rendered(job_id: str, idx: int, scene: dict) -> bool:
@@ -189,6 +211,7 @@ async def load_state(job_id: str) -> dict | None:
     return {
         "job_id": job["id"],
         "prompt": job["prompt"],
+        "plan_mode": job["plan_mode"],
         "model": job["model"],
         "aspect_ratio": job["aspect_ratio"],
         "target_duration_s": job["target_duration_s"],

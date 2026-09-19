@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
 from PIL import Image
@@ -8,8 +9,18 @@ from app.config import settings
 
 
 async def validate(state: dict) -> dict:
-    """Validate uploaded images: format, size, convert to RGB, resize+pad."""
-    image_paths = state["image_paths"]
+    """Validate uploaded images: format, size, convert to RGB, resize+pad.
+
+    The work is synchronous Pillow code, so it runs in a thread: since 0.8.0
+    create_job calls this straight from a request handler (manual plans skip
+    run_planning), where blocking the event loop would stall every other job's
+    SSE stream for as long as the images take.
+    """
+    return await asyncio.to_thread(process_images, state["image_paths"])
+
+
+def process_images(image_paths: list[str]) -> dict:
+    """Synchronous core of validate(). Returns a partial state dict."""
     if not image_paths:
         return {"error": "No images provided", "status": "error"}
 

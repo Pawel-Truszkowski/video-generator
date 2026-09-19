@@ -131,6 +131,15 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         # the three cases need different answers to a resume attempt.
         await db.execute("ALTER TABLE jobs ADD COLUMN workdirs_purged_at TEXT")
 
+    if "plan_mode" not in cols:
+        # Who wrote the scene list: 'auto' = the LLM planner, 'manual' = the user
+        # on the upload screen (0.8.0). It decides what `jobs.prompt` means — a
+        # film description for the planner, or a style appended to every scene —
+        # and whether /plan and /resume may run the planner at all: that ends in
+        # save_scenes, which would replace the user's plan. Every job before
+        # 0.8.0 was planned by the LLM, so 'auto' is the truthful default.
+        await db.execute("ALTER TABLE jobs ADD COLUMN plan_mode TEXT NOT NULL DEFAULT 'auto'")
+
     scene_cols = await _column_names(db, "scenes")
 
     if "error" not in scene_cols:

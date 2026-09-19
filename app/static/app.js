@@ -18,6 +18,12 @@
   // plan editor's working copy) because this one carries status/error and is
   // refreshed by SSE rather than edited by the user.
   let progressScenes = [];
+  // The manual plan being written on the upload screen, before any job exists.
+  // Same shape as currentScenes; it becomes the job's plan in one POST /jobs.
+  let draftScenes = [];
+  // One object URL per File: renderers run on every keystroke-level structure
+  // change, and a fresh createObjectURL each time would leak a blob per render.
+  const fileUrls = new WeakMap();
 
   // Elements
   const dropzone = document.getElementById('dropzone');
@@ -31,6 +37,12 @@
   const btnGenerate = document.getElementById('btn-generate');
   const btnBack = document.getElementById('btn-back');
   const btnAddScene = document.getElementById('btn-add-scene');
+  const draftGroup = document.getElementById('draft-group');
+  const draftScenesEl = document.getElementById('draft-scenes');
+  const draftWarning = document.getElementById('draft-warning');
+  const durationGroup = document.getElementById('duration-group');
+  const promptLabel = document.getElementById('prompt-label');
+  const planModeInputs = document.querySelectorAll('input[name="plan-mode"]');
 
   const screenForm = document.getElementById('screen-form');
   const screenPlan = document.getElementById('screen-plan');
@@ -164,7 +176,9 @@
     jobId = null;
     files = [];
     currentScenes = [];
+    draftScenes = [];
     renderPreviews();
+    renderDraft();
     updatePlanButton();
     showScreen('screen-login');
   }
@@ -193,9 +207,80 @@
       if (files.length >= 30) break;
       if (!f.type.match(/^image\/(jpeg|png|webp)$/)) continue;
       files.push(f);
+      // One scene per image by default: the common case is "each photo is a shot".
+      draftScenes.push({
+        image_index: files.length - 1, sub_prompt: '', duration_s: 5, chain_from_prev: false,
+      });
     }
     renderPreviews();
+    renderDraft();
     updatePlanButton();
+  }
+
+  function fileUrl(f) {
+    if (!fileUrls.has(f)) fileUrls.set(f, URL.createObjectURL(f));
+    return fileUrls.get(f);
+  }
+
+  /**
+   * Drop image `removed` from the draft: its own scene goes, together with the
+   * continuations hanging off it (they would silently start chaining from a
+   * different shot), and every later image_index shifts down by one.
+   */
+  function removeImageFromDraft(removed) {
+    const kept = [];
+    let dropping = false;
+    for (const s of draftScenes) {
+      if (!s.chain_from_prev) dropping = s.image_index === removed;
+      if (!dropping) kept.push(s);
+    }
+    kept.forEach(s => { if (s.image_index > removed) s.image_index -= 1; });
+    if (kept.length) kept[0].chain_from_prev = false;
+    draftScenes = kept;
+  }
+
+  function planMode() {
+    return document.querySelector('input[name="plan-mode"]:checked').value;
+  }
+
+  function planButtonLabel() {
+    return planMode() === 'manual' ? 'Dalej' : 'Zaplanuj';
+  }
+
+  /** Show the parts of the upload screen that belong to the chosen mode. */
+  function applyPlanMode() {
+    const manual = planMode() === 'manual';
+    draftGroup.classList.toggle('hidden', !manual);
+    durationGroup.classList.toggle('hidden', manual);
+    promptLabel.textContent = manual
+      ? 'Styl (opcjonalnie, dodawany do kazdej sceny)'
+      : 'Opis filmu';
+    promptEl.placeholder = manual
+      ? 'np. realistic footage, stable camera, soft studio lighting'
+      : 'Opisz jaki film chcesz wygenerowac...';
+    btnPlan.textContent = planButtonLabel();
+    updatePlanButton();
+  }
+  planModeInputs.forEach(r => r.addEventListener('change', applyPlanMode));
+  applyPlanMode();
+
+  function renderDraft() {
+    renderSceneCards(draftScenesEl, draftScenes, {
+      imageSrc: i => (files[i] ? fileUrl(files[i]) : ''),
+      imageCount: files.length,
+      onInput: updatePlanButton,
+      onFieldChange: () => {},
+      onStructureChange: () => { renderDraft(); updatePlanButton(); },
+    });
+
+    // An image only reaches the film through a scene that starts from it;
+    // a continuation starts from the previous clip's last frame instead.
+    const used = new Set(draftScenes.filter(s => !s.chain_from_prev).map(s => s.image_index));
+    const unused = files.map((_, i) => i).filter(i => !used.has(i));
+    draftWarning.textContent = unused.length
+      ? `Zdjecia ${unused.map(i => '#' + (i + 1)).join(', ')} nie startuja zadnej sceny i nie trafia do filmu.`
+      : '';
+    draftWarning.classList.toggle('hidden', !unused.length);
   }
 
   function renderPreviews() {
@@ -205,11 +290,17 @@
       wrap.className = 'preview-item';
       const img = document.createElement('img');
       img.className = 'preview-thumb';
-      img.src = URL.createObjectURL(f);
+      img.src = fileUrl(f);
       const btn = document.createElement('button');
       btn.className = 'preview-remove';
       btn.textContent = '\u00d7';
-      btn.onclick = () => { files.splice(i, 1); renderPreviews(); updatePlanButton(); };
+      btn.onclick = () => {
+        files.splice(i, 1);
+        removeImageFromDraft(i);
+        renderPreviews();
+        renderDraft();
+        updatePlanButton();
+      };
       wrap.appendChild(img);
       wrap.appendChild(btn);
       previews.appendChild(wrap);
@@ -217,19 +308,29 @@
   }
 
   function updatePlanButton() {
-    btnPlan.disabled = files.length === 0 || promptEl.value.trim() === '';
+    if (planMode() === 'manual') {
+      // The style is optional here; what the provider cannot do without is a
+      // description of each scene's motion.
+      btnPlan.disabled = files.length === 0 || draftScenes.length === 0
+        || draftScenes.some(s => !s.sub_prompt.trim());
+    } else {
+      btnPlan.disabled = files.length === 0 || promptEl.value.trim() === '';
+    }
   }
   promptEl.addEventListener('input', updatePlanButton);
 
   btnPlan.addEventListener('click', async () => {
+    const manual = planMode() === 'manual';
     btnPlan.disabled = true;
-    btnPlan.textContent = 'Planowanie...';
+    btnPlan.textContent = manual ? 'Wysylanie...' : 'Planowanie...';
 
     const fd = new FormData();
     files.forEach(f => fd.append('images', f));
     fd.append('prompt', promptEl.value.trim());
     fd.append('model', modelEl.value);
     fd.append('target_duration_s', durationEl.value);
+    fd.append('plan_mode', planMode());
+    if (manual) fd.append('scenes', JSON.stringify(draftScenes));
 
     try {
       const res = await apiFetch('/jobs', { method: 'POST', body: fd });
@@ -238,13 +339,21 @@
       jobId = data.job_id;
 
       connectSSE();
+      if (manual) {
+        // The job is already 'planned'. The scenes come back from the server
+        // rather than from draftScenes, since it may have corrected them.
+        imageCount = files.length;
+        currentScenes = data.scenes;
+        showPlanScreen(data.credits_cost);
+        return;
+      }
       const planRes = await apiFetch(`/jobs/${jobId}/plan`, { method: 'POST' });
       if (!planRes.ok) throw new Error(await errText(planRes));
     } catch (e) {
       if (e.message !== 'UNAUTHORIZED') {
         alert('Blad: ' + e.message);
-        btnPlan.disabled = false;
-        btnPlan.textContent = 'Zaplanuj';
+        btnPlan.textContent = planButtonLabel();
+        updatePlanButton();
       }
     }
   });
@@ -343,55 +452,83 @@
     renderScenes();
     recalcDuration();
     setCost(creditsCost);
-    btnPlan.disabled = false;
-    btnPlan.textContent = 'Zaplanuj';
+    btnPlan.textContent = planButtonLabel();
+    updatePlanButton();
     // showProgressScreen() disables it, and a resume can land here afterwards.
     btnGenerate.disabled = false;
   }
 
   /** Local File while the upload is still in this tab, server copy after a resume. */
   function sceneImageSrc(imageIndex) {
-    if (files[imageIndex]) return URL.createObjectURL(files[imageIndex]);
+    if (files[imageIndex]) return fileUrl(files[imageIndex]);
     if (jobId) return `/jobs/${jobId}/images/${imageIndex}`;
     return '';
   }
 
+  /** The plan editor on screen 2: every change goes straight to the server. */
   function renderScenes() {
-    scenesList.innerHTML = '';
+    renderSceneCards(scenesList, currentScenes, {
+      imageSrc: sceneImageSrc,
+      imageCount: files.length || imageCount,
+      onFieldChange: i => { recalcDuration(); syncScenesToBackend(i); },
+      // chain_from_prev changes how scenes group into chains, so it goes through
+      // /scenes/sync like add/remove; /scenes/{idx}/update is per-field only.
+      onStructureChange: () => { renderScenes(); recalcDuration(); syncAllScenes(); },
+    });
+  }
 
-    currentScenes.forEach((s, i) => {
+  /**
+   * Scene cards, shared by the upload screen (draft, local only) and the plan
+   * editor (synced). Edits mutate `scenes` in place; `opts` says what else to do:
+   *   imageSrc(i)          thumbnail URL for image i
+   *   imageCount           options in the image picker
+   *   onInput()            optional, on every keystroke in a description
+   *   onFieldChange(i)     a field of scene i changed (text, duration, image)
+   *   onStructureChange()  scenes added/removed or chaining changed; re-render
+   */
+  function renderSceneCards(container, scenes, opts) {
+    container.innerHTML = '';
+
+    scenes.forEach((s, i) => {
       const card = document.createElement('div');
-      card.className = 'scene-card';
+      card.className = 'scene-card' + (s.chain_from_prev ? ' chained' : '');
 
+      // A continuation starts from the previous clip's last frame, not from its
+      // image_index — show that instead of a picture that will not be used.
       const img = document.createElement('img');
-      img.src = sceneImageSrc(s.image_index);
+      img.src = opts.imageSrc(s.image_index);
+      img.title = s.chain_from_prev ? `Start z ostatniej klatki sceny ${i}` : '';
 
       const info = document.createElement('div');
       info.className = 'scene-info';
 
-      // Header row with scene number and remove button
       const idx = document.createElement('div');
       idx.className = 'scene-idx';
       const label = document.createElement('span');
       label.textContent = `Scena ${i + 1}` + (s.chain_from_prev ? ' (kontynuacja)' : '');
       idx.appendChild(label);
 
-      if (currentScenes.length > 1) {
+      if (scenes.length > 1) {
         const removeBtn = document.createElement('button');
         removeBtn.className = 'scene-remove';
         removeBtn.textContent = 'Usun';
-        removeBtn.onclick = () => removeScene(i);
+        removeBtn.onclick = () => {
+          scenes.splice(i, 1);
+          if (scenes.length) scenes[0].chain_from_prev = false;
+          opts.onStructureChange();
+        };
         idx.appendChild(removeBtn);
       }
 
       const ta = document.createElement('textarea');
       ta.value = s.sub_prompt;
-      ta.addEventListener('change', () => {
-        currentScenes[i].sub_prompt = ta.value;
-        syncScenesToBackend(i);
+      ta.placeholder = 'Co dzieje sie w tej scenie? Ruch kamery, akcja...';
+      ta.addEventListener('input', () => {
+        s.sub_prompt = ta.value;
+        if (opts.onInput) opts.onInput();
       });
+      ta.addEventListener('change', () => opts.onFieldChange(i));
 
-      // Controls row: duration select + image select + chain checkbox
       const controls = document.createElement('div');
       controls.className = 'scene-controls';
 
@@ -405,49 +542,72 @@
         durSel.appendChild(opt);
       });
       durSel.addEventListener('change', () => {
-        currentScenes[i].duration_s = parseInt(durSel.value);
-        recalcDuration();
-        syncScenesToBackend(i);
+        s.duration_s = parseInt(durSel.value);
+        opts.onFieldChange(i);
       });
-
-      const imgLabel = document.createElement('label');
-      imgLabel.textContent = 'Zdjecie:';
-      const imgSel = document.createElement('select');
-      for (let fi = 0; fi < (files.length || imageCount); fi++) {
-        const opt = document.createElement('option');
-        opt.value = fi; opt.textContent = `#${fi + 1}`;
-        if (fi === s.image_index) opt.selected = true;
-        imgSel.appendChild(opt);
-      }
-      imgSel.addEventListener('change', () => {
-        currentScenes[i].image_index = parseInt(imgSel.value);
-        img.src = sceneImageSrc(currentScenes[i].image_index);
-        syncScenesToBackend(i);
-      });
-
       controls.appendChild(durLabel);
       controls.appendChild(durSel);
-      controls.appendChild(imgLabel);
-      controls.appendChild(imgSel);
+
+      if (s.chain_from_prev) {
+        const hint = document.createElement('span');
+        hint.className = 'scene-chain-hint';
+        hint.textContent = `start z ostatniej klatki sceny ${i}`;
+        controls.appendChild(hint);
+      } else {
+        const imgLabel = document.createElement('label');
+        imgLabel.textContent = 'Zdjecie:';
+        const imgSel = document.createElement('select');
+        for (let fi = 0; fi < opts.imageCount; fi++) {
+          const opt = document.createElement('option');
+          opt.value = fi; opt.textContent = `#${fi + 1}`;
+          if (fi === s.image_index) opt.selected = true;
+          imgSel.appendChild(opt);
+        }
+        imgSel.addEventListener('change', () => {
+          s.image_index = parseInt(imgSel.value);
+          img.src = opts.imageSrc(s.image_index);
+          opts.onFieldChange(i);
+        });
+        controls.appendChild(imgLabel);
+        controls.appendChild(imgSel);
+      }
+
+      if (i > 0) {
+        const chainLabel = document.createElement('label');
+        chainLabel.className = 'scene-chain';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!s.chain_from_prev;
+        cb.addEventListener('change', () => {
+          s.chain_from_prev = cb.checked;
+          // Ignored by the pipeline for a continuation, but keeps the thumbnail
+          // meaningful: the shot this scene grows out of.
+          if (cb.checked) s.image_index = scenes[i - 1].image_index;
+          opts.onStructureChange();
+        });
+        chainLabel.appendChild(cb);
+        chainLabel.appendChild(document.createTextNode(' Kontynuuj poprzednia'));
+        controls.appendChild(chainLabel);
+      }
+
+      const addCont = document.createElement('button');
+      addCont.className = 'btn-link scene-add-cont';
+      addCont.textContent = '+ kontynuacja';
+      addCont.onclick = () => {
+        scenes.splice(i + 1, 0, {
+          image_index: s.image_index, sub_prompt: '', duration_s: 5, chain_from_prev: true,
+        });
+        opts.onStructureChange();
+      };
+      controls.appendChild(addCont);
 
       info.appendChild(idx);
       info.appendChild(ta);
       info.appendChild(controls);
       card.appendChild(img);
       card.appendChild(info);
-      scenesList.appendChild(card);
+      container.appendChild(card);
     });
-  }
-
-  function removeScene(idx) {
-    currentScenes.splice(idx, 1);
-    // Fix chain_from_prev for new first scene
-    if (currentScenes.length > 0) {
-      currentScenes[0].chain_from_prev = false;
-    }
-    renderScenes();
-    recalcDuration();
-    syncAllScenes();
   }
 
   btnAddScene.addEventListener('click', () => {
@@ -845,7 +1005,8 @@
 
     const prompt = document.createElement('div');
     prompt.className = 'job-prompt';
-    prompt.textContent = job.prompt;
+    // A manual plan may have no style, and then no prompt at all.
+    prompt.textContent = job.prompt || `Plan reczny · ${job.scene_count} scen`;
 
     const meta = document.createElement('div');
     meta.className = 'job-meta';

@@ -65,6 +65,22 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .scene-card .scene-controls { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 .scene-card .scene-controls select { width: auto; min-width: 60px; }
 .scene-card .scene-controls label { margin: 0; font-size: 0.75rem; }
+.scene-card .scene-controls { flex-wrap: wrap; }
+/* A continuation starts from the previous clip's last frame; its own image is unused. */
+.scene-card.chained { border-left: 3px solid #4f8cff; }
+.scene-card.chained img { opacity: 0.35; filter: grayscale(1); }
+.scene-chain-hint { font-size: 0.75rem; color: #888; font-style: italic; }
+.scene-card .scene-controls label.scene-chain { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.scene-add-cont { font-size: 0.75rem; margin-left: auto; }
+
+/* Upload screen: plan mode switch + draft plan */
+.mode-switch { display: flex; gap: 16px; }
+.mode-switch label { display: flex; align-items: center; gap: 6px; color: #e0e0e0; font-size: 0.9rem; cursor: pointer; margin: 0; }
+.draft-warning { margin-top: 8px; font-size: 0.8rem; color: #f0b429; }
+@media (max-width: 600px) {
+  .scene-card { flex-direction: column; }
+  .scene-card img { width: 100%; height: auto; max-height: 180px; }
+}
 
 .cost-box {
   background: #1e2a1e; border: 1px solid #27ae60; border-radius: 8px;

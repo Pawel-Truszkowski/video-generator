@@ -239,6 +239,8 @@ Zaleznosci: Faza 1-3
 - [ ] Integracja: Resend lub SendGrid (prosty API)
 
 ### 5.2 Polepszenie UI
+- [x] Reczny plan scen na ekranie wgrywania (karta na zdjecie, opis ruchu,
+      dlugosc, lancuchowanie), planer AI jako opcja — ZROBIONE (0.8.0)
 - [ ] Drag & drop zmiany kolejnosci scen
 - [ ] Podglad klipu po wygenerowaniu (przed stitchem)
 - [ ] Pasek postepu per scena — czesciowo w 1.2 (lista scen + zdarzenie SSE `scene`);
