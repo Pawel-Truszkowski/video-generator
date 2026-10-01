@@ -9,7 +9,13 @@ from app.providers.base import ProviderError
 from app.providers.mock_provider import MockProvider
 from app.providers.fal_provider import FalProvider
 from app.services.ffmpeg import extract_last_frame
-from app.services.job_state import clip_path_for, clips_dir, frames_dir, is_rendered
+from app.services.job_state import (
+    clip_path_for,
+    clips_dir,
+    frames_dir,
+    is_rendered,
+    scene_prompt,
+)
 
 SceneDone = Callable[[int, str], Awaitable[None]]
 SceneError = Callable[[int, str], Awaitable[None]]
@@ -43,6 +49,9 @@ async def generate_clips(
     model = state["model"]
     aspect_ratio = state["aspect_ratio"]
     job_id = state["job_id"]
+    # Only a manual plan's jobs.prompt is a style; an LLM plan's is the film
+    # description the planner already turned into sub_prompts.
+    style = state["prompt"] if state.get("plan_mode") == "manual" else ""
 
     provider = _get_provider()
     semaphore = asyncio.Semaphore(settings.semaphore_limit)
@@ -89,7 +98,7 @@ async def generate_clips(
                     clip_path = await asyncio.wait_for(
                         provider.generate_clip(
                             image_path=input_image,
-                            prompt=scene["sub_prompt"],
+                            prompt=scene_prompt(scene["sub_prompt"], style),
                             duration_s=scene["duration_s"],
                             aspect_ratio=aspect_ratio,
                             model=model,

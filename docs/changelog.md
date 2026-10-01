@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.8.0] — 2026-09-18 — Reczny plan scen jako domyslny tryb
+
+Planer LLM dostawal tylko liczbe zdjec i ogolny opis — nie widzial zdjec, wiec
+`sub_prompt` rozjezdzaly sie z trescia klatek (sprawdzone na sekwencji 10 klatek
+artroskopii kolana). Teraz uzytkownik od razu na ekranie wgrywania dostaje karte
+sceny na kazde zdjecie; planer AI zostaje jako przelacznik i dziala jak wczesniej.
+
+- **`POST /jobs` z `plan_mode=manual` i `scenes` (JSON)** tworzy job od razu w
+  statusie `planned` — bez `/plan` i bez `run_planning`. Walidacja (model, tryb,
+  `SceneItem`, zakres `image_index`, `_normalize_manual_scenes`) biegnie **przed**
+  zapisem na dysk; `validate()` po zapisie plikow, a jej blad zostawia pliki dla
+  orphan sweepa. Sceny sa zapisywane przed zmiana statusu: crash pomiedzy daje
+  `uploaded` + sceny, co `_decide_stage` juz czyta jako `planned`
+- **Nowa kolumna `jobs.plan_mode`** (`auto` | `manual`, stare joby `auto`).
+  Decyduje, czym jest `jobs.prompt`: w `manual` to opcjonalny **styl** doklejany
+  do kazdej sceny (`job_state.scene_prompt`), w `auto` opis filmu, ktorego sie
+  nie dokleja. Blokuje tez LLM: `/plan` na jobie recznym to 409, a `/resume`
+  recznego joba bez scen to 409 zamiast odpalenia planera — `run_planning`
+  konczy sie `save_scenes` (DELETE+INSERT) i nadpisalby plan uzytkownika
+- **Reguly planu recznego** (`_normalize_manual_scenes`): pierwsza scena z
+  `chain_from_prev` i pusty opis to 400 z numerem sceny. Kontynuacja na koncu
+  filmu jest poprawna i nie jest ruszana. Zdjecie, od ktorego nie startuje zadna
+  scena, przechodzi — UI tylko ostrzega
+- **Wspolny renderer kart scen** (`renderSceneCards` w `app.js`) dla szkicu na
+  ekranie 1 i edytora na ekranie 2. Nowe na obu: checkbox „Kontynuuj poprzednia”
+  i przycisk „+ kontynuacja”. Scena-kontynuacja pokazuje wyszarzona miniature i
+  „start z ostatniej klatki sceny N”, bo pipeline ignoruje wtedy jej zdjecie.
+  Zmiana lancuchowania w edytorze idzie przez `/scenes/sync` (zmienia grupowanie
+  lancuchow), nie przez `/scenes/{idx}/update`
+- `validate()` wydzielone na synchroniczne `process_images()` uruchamiane przez
+  `asyncio.to_thread` — od 0.8.0 wolane prosto z handlera, gdzie Pillow
+  blokowalby event loop (a z nim SSE innych jobow)
+- Miniatury z `File` maja jeden object URL na plik (`WeakMap`), zamiast nowego
+  `createObjectURL` przy kazdym renderze
+
 ## [0.7.0] — 2026-09-15 — System kredytowy i platnosci (roadmap Faza 3)
 
 Do tej pory kazdy zalogowany uzytkownik wydawal pieniadze wlasciciela instancji,

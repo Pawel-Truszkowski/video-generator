@@ -9,7 +9,8 @@ import uuid
 import aiosqlite
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from app.auth.deps import get_owned_job, require_user
@@ -21,6 +22,7 @@ from app.graph.pipeline import (
     run_generation,
     run_planning,
 )
+from app.graph.nodes.validate import validate
 from app.services import cleanup, credits, job_state
 from app.services.job_state import STALE_STATUSES
 
@@ -126,6 +128,17 @@ def _assert_valid_duration(duration_s: int) -> None:
         raise HTTPException(400, f"Nieprawidłowa długość sceny: {duration_s}s (dozwolone: {allowed})")
 
 
+def _assert_valid_image_indexes(scenes: list[dict], image_count: int) -> None:
+    """Every scene must point at an uploaded image.
+
+    Checked on the request, not in generate_clips: an out-of-range index would
+    otherwise surface from a background task as a bare 'error' status.
+    """
+    for s in scenes:
+        if s["image_index"] < 0 or s["image_index"] >= image_count:
+            raise HTTPException(400, f"Nieprawidłowy indeks zdjęcia: {s['image_index']}")
+
+
 def _assert_valid_model(model: str) -> None:
     """Refuse a model with no price. See job_state.cost_per_second()."""
     if model not in settings.model_costs:
@@ -183,21 +196,129 @@ def _assert_files_present(job: aiosqlite.Row) -> None:
         )
 
 
+class SceneItem(BaseModel):
+    image_index: int
+    sub_prompt: str
+    duration_s: int
+    chain_from_prev: bool = False
+
+    @field_validator("duration_s")
+    @classmethod
+    def _known_duration(cls, v: int) -> int:
+        # Same allowlist as _assert_valid_duration, enforced here because this
+        # body arrives straight from the client and is priced as-is. A 422 from
+        # pydantic is fine — errText() in app.js already surfaces its detail.
+        if v not in settings.allowed_durations:
+            allowed = ", ".join(str(d) for d in settings.allowed_durations)
+            raise ValueError(f"Nieprawidłowa długość sceny: {v}s (dozwolone: {allowed})")
+        return v
+
+
+class SyncScenesRequest(BaseModel):
+    # Upper bound on plan length: this endpoint replaces the whole scene list
+    # with whatever the client sends, and every scene is a paid provider call.
+    scenes: list[SceneItem] = Field(..., max_length=settings.max_scenes_per_job)
+
+
+@router.post("/jobs/{job_id}/scenes/sync")
+async def sync_scenes(
+    job_id: str,
+    body: SyncScenesRequest,
+    job: aiosqlite.Row = Depends(get_owned_job),
+):
+    """Replace the entire scene list (add/remove/reorder scenes)."""
+    state = await job_state.load_state(job_id)
+    if state is None:
+        raise HTTPException(404, "Job not found")
+
+    _assert_plan_editable(job, state["scenes"])
+
+    scenes = [s.model_dump() for s in body.scenes]
+
+    _assert_valid_image_indexes(scenes, len(state["image_paths"]))
+
+    await job_state.save_scenes(job_id, scenes)
+
+    est_cost = job_state.recalc_cost(state["model"], scenes)
+    await job_state.set_job_cost(job_id, est_cost)
+
+    return {
+        "est_cost_usd": est_cost,
+        "credits_cost": credits.credits_for(state["model"], scenes),
+        "scene_count": len(scenes),
+    }
+
+
+PLAN_MODES = ("auto", "manual")
+
+
+def _normalize_manual_scenes(scenes: list[dict], image_count: int) -> list[dict]:
+    """Bring a user-authored plan into the shape generate_clips expects.
+
+    Runs after SceneItem has already enforced types and the duration allowlist,
+    and before anything is written to disk: raise HTTPException(400, ...) to
+    refuse the whole request, or return a (possibly corrected) scene list.
+    """
+    
+    if scenes[0]["chain_from_prev"]:
+        raise HTTPException(400, "Pierwsza scena nie może być połączona z poprzednią") 
+    
+    for i, scene in enumerate(scenes):
+        if scene["sub_prompt"].strip() =="":
+            raise HTTPException(400, f"Scena {i + 1} ma pusty opis")
+    
+    return scenes
+
+
 @router.post("/jobs")
 async def create_job(
     images: list[UploadFile] = File(...),
-    prompt: str = Form(...),
+    prompt: str = Form(""),
     model: str = Form("wan"),
     aspect_ratio: str = Form("16:9"),
     target_duration_s: int = Form(120),
+    plan_mode: str = Form("auto"),
+    scenes: str | None = Form(None),
     user: aiosqlite.Row = Depends(require_user),
 ):
-    # Before touching the disk: an unpriceable model would create a job that
-    # every later cost call refuses, with the uploads already written.
+    """Store the uploads and create the job.
+
+    plan_mode='auto'   — the job waits in 'uploaded' for POST /plan (LLM planner);
+                         `prompt` is the film description and is required.
+    plan_mode='manual' — `scenes` (JSON list of SceneItem) is the plan; the job
+                         comes back already 'planned' and never goes through
+                         run_planning, whose save_scenes would replace it.
+                         `prompt` is an optional style appended to every scene.
+    """
+    # Everything that can refuse the request runs before touching the disk: an
+    # unpriceable model or a broken plan would otherwise leave uploads behind.
     _assert_valid_model(model)
+    if plan_mode not in PLAN_MODES:
+        raise HTTPException(400, f"Nieznany tryb planu: {plan_mode}")
+    prompt = prompt.strip()
+
+    manual_scenes: list[dict] | None = None
+    if plan_mode == "manual":
+        if not scenes:
+            raise HTTPException(400, "Brak listy scen dla planu ręcznego")
+        try:
+            body = SyncScenesRequest.model_validate({"scenes": json.loads(scenes)})
+        except json.JSONDecodeError:
+            raise HTTPException(400, "Lista scen nie jest poprawnym JSON-em")
+        except ValidationError as e:
+            # Same 422 shape FastAPI gives a bad JSON body, so errText() in
+            # app.js reads it without a special case.
+            raise RequestValidationError(e.errors())
+        manual_scenes = [sc.model_dump() for sc in body.scenes]
+        if not manual_scenes:
+            raise HTTPException(400, "Plan musi mieć co najmniej jedną scenę")
+        _assert_valid_image_indexes(manual_scenes, len(images))
+        manual_scenes = _normalize_manual_scenes(manual_scenes, len(images))
+    elif not prompt:
+        raise HTTPException(400, "Opis filmu jest wymagany dla plannera AI")
 
     job_id = uuid.uuid4().hex[:12]
-    upload_dir = os.path.join(settings.data_dir, "uploads", job_id)
+    upload_dir = job_state.uploads_dir(job_id)
     os.makedirs(upload_dir, exist_ok=True)
 
     image_paths = []
@@ -214,16 +335,43 @@ async def create_job(
     if not image_paths:
         raise HTTPException(400, "No images provided")
 
+    if manual_scenes is not None:
+        # Here rather than in a background task: there is no planning step left
+        # to host it. A refusal leaves the uploads without a row, which is
+        # exactly what the orphan sweep in services/cleanup.py collects.
+        result = await validate({"image_paths": image_paths})
+        if result.get("status") == "error":
+            raise HTTPException(400, result["error"])
+        target_duration_s = sum(sc["duration_s"] for sc in manual_scenes)
+
     db = await get_db()
     await db.execute(
         "INSERT INTO jobs (id, status, prompt, model, aspect_ratio, target_duration_s, "
-        "user_id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-        (job_id, "uploaded", prompt, model, aspect_ratio, target_duration_s, user["id"]),
+        "user_id, plan_mode, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+        (job_id, "uploaded", prompt, model, aspect_ratio, target_duration_s,
+         user["id"], plan_mode),
     )
     await db.commit()
 
-    return {"job_id": job_id}
+    if manual_scenes is None:
+        return {"job_id": job_id, "status": "uploaded"}
+
+    # Scenes before status: a crash in between leaves 'uploaded' + scenes, which
+    # _decide_stage already reads as 'planned'. The reverse order would leave a
+    # 'planned' job with no plan.
+    await job_state.save_scenes(job_id, manual_scenes)
+    await job_state.set_job_cost(job_id, job_state.recalc_cost(model, manual_scenes))
+    await _set_status(job_id, "planned")
+
+    return {
+        "job_id": job_id,
+        "status": "planned",
+        "credits_cost": credits.credits_for(model, manual_scenes),
+        # What was stored, which may differ from what was sent: the editor must
+        # start from the server's version of the plan.
+        "scenes": manual_scenes,
+    }
 
 
 @router.get("/jobs")
@@ -235,7 +383,7 @@ async def list_jobs(
     """Read-only list for the 'Moje filmy' screen."""
     db = await get_db()
     rows = await db.execute(
-        "SELECT j.id, j.status, j.prompt, j.model, j.est_cost_usd, j.created_at, j.error, "
+        "SELECT j.id, j.status, j.prompt, j.plan_mode, j.model, j.est_cost_usd, j.created_at, j.error, "
         "       j.workdirs_purged_at, "
         "       COUNT(s.id) AS scene_count, "
         "       COALESCE(SUM(s.duration_s), 0) AS total_duration_s "
@@ -271,6 +419,10 @@ async def list_jobs(
 async def plan_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     if job["status"] not in ("uploaded", "error", "interrupted"):
         raise HTTPException(400, f"Job is already in status: {job['status']}")
+    # run_planning ends in save_scenes (DELETE + INSERT): on a manual job that
+    # would replace the user's plan with one the LLM made up.
+    if job["plan_mode"] == "manual":
+        raise HTTPException(409, "Ten film ma ręczny plan — edytuj sceny zamiast planować")
 
     _assert_files_present(job)
 
@@ -351,62 +503,6 @@ async def update_scene(
     }
 
 
-class SceneItem(BaseModel):
-    image_index: int
-    sub_prompt: str
-    duration_s: int
-    chain_from_prev: bool = False
-
-    @field_validator("duration_s")
-    @classmethod
-    def _known_duration(cls, v: int) -> int:
-        # Same allowlist as _assert_valid_duration, enforced here because this
-        # body arrives straight from the client and is priced as-is. A 422 from
-        # pydantic is fine — errText() in app.js already surfaces its detail.
-        if v not in settings.allowed_durations:
-            allowed = ", ".join(str(d) for d in settings.allowed_durations)
-            raise ValueError(f"Nieprawidłowa długość sceny: {v}s (dozwolone: {allowed})")
-        return v
-
-
-class SyncScenesRequest(BaseModel):
-    # Upper bound on plan length: this endpoint replaces the whole scene list
-    # with whatever the client sends, and every scene is a paid provider call.
-    scenes: list[SceneItem] = Field(..., max_length=settings.max_scenes_per_job)
-
-
-@router.post("/jobs/{job_id}/scenes/sync")
-async def sync_scenes(
-    job_id: str,
-    body: SyncScenesRequest,
-    job: aiosqlite.Row = Depends(get_owned_job),
-):
-    """Replace the entire scene list (add/remove/reorder scenes)."""
-    state = await job_state.load_state(job_id)
-    if state is None:
-        raise HTTPException(404, "Job not found")
-
-    _assert_plan_editable(job, state["scenes"])
-
-    scenes = [s.model_dump() for s in body.scenes]
-
-    image_count = len(state["image_paths"])
-    for s in scenes:
-        if s["image_index"] < 0 or s["image_index"] >= image_count:
-            raise HTTPException(400, f"Nieprawidłowy indeks zdjęcia: {s['image_index']}")
-
-    await job_state.save_scenes(job_id, scenes)
-
-    est_cost = job_state.recalc_cost(state["model"], scenes)
-    await job_state.set_job_cost(job_id, est_cost)
-
-    return {
-        "est_cost_usd": est_cost,
-        "credits_cost": credits.credits_for(state["model"], scenes),
-        "scene_count": len(scenes),
-    }
-
-
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
     db = await get_db()
@@ -421,6 +517,7 @@ async def get_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
         "image_count": len(job_state.image_paths_for(job["id"])),
         "status": job["status"],
         "prompt": job["prompt"],
+        "plan_mode": job["plan_mode"],
         "model": job["model"],
         "aspect_ratio": job["aspect_ratio"],
         "target_duration_s": job["target_duration_s"],
@@ -616,6 +713,10 @@ async def resume_job(job_id: str, job: aiosqlite.Row = Depends(get_owned_job)):
 
     stage = _decide_stage(job, state["scenes"])
 
+    if stage == "planning" and job["plan_mode"] == "manual":
+        # Only reachable if the process died between the INSERT and save_scenes
+        # in create_job. Nothing to resume from, and the LLM must not fill in.
+        raise HTTPException(409, "Plan tego filmu nie został zapisany — utwórz film ponownie")
     if stage == "planning":
         await _set_status(job_id, "uploaded")
         _start(job_id, job["user_id"], run_planning(job_id, state))
