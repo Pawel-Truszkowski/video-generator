@@ -16,10 +16,10 @@ async def validate(state: dict) -> dict:
     run_planning), where blocking the event loop would stall every other job's
     SSE stream for as long as the images take.
     """
-    return await asyncio.to_thread(process_images, state["image_paths"])
+    return await asyncio.to_thread(_process_images, state["image_paths"])
 
 
-def process_images(image_paths: list[str]) -> dict:
+def _process_images(image_paths: list[str]) -> dict:
     """Synchronous core of validate(). Returns a partial state dict."""
     if not image_paths:
         return {"error": "No images provided", "status": "error"}

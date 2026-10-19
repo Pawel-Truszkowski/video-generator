@@ -8,21 +8,21 @@ import uuid
 
 import aiosqlite
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from app.auth.deps import get_owned_job, require_user
 from app.config import settings
 from app.db import get_db
+from app.graph.nodes.validate import validate
 from app.graph.pipeline import (
     get_event_queue,
     release_event_queue,
     run_generation,
     run_planning,
 )
-from app.graph.nodes.validate import validate
 from app.services import cleanup, credits, job_state
 from app.services.job_state import STALE_STATUSES
 
@@ -252,22 +252,13 @@ async def sync_scenes(
 PLAN_MODES = ("auto", "manual")
 
 
-def _normalize_manual_scenes(scenes: list[dict], image_count: int) -> list[dict]:
-    """Bring a user-authored plan into the shape generate_clips expects.
-
-    Runs after SceneItem has already enforced types and the duration allowlist,
-    and before anything is written to disk: raise HTTPException(400, ...) to
-    refuse the whole request, or return a (possibly corrected) scene list.
-    """
-    
+def _assert_valid_manual_scenes(scenes: list[dict]) -> None:
+    """What SceneItem cannot check per item: the plan as a whole."""
     if scenes[0]["chain_from_prev"]:
-        raise HTTPException(400, "Pierwsza scena nie może być połączona z poprzednią") 
-    
+        raise HTTPException(400, "Pierwsza scena nie może być połączona z poprzednią")
     for i, scene in enumerate(scenes):
-        if scene["sub_prompt"].strip() =="":
+        if not scene["sub_prompt"].strip():
             raise HTTPException(400, f"Scena {i + 1} ma pusty opis")
-    
-    return scenes
 
 
 @router.post("/jobs")
@@ -313,7 +304,7 @@ async def create_job(
         if not manual_scenes:
             raise HTTPException(400, "Plan musi mieć co najmniej jedną scenę")
         _assert_valid_image_indexes(manual_scenes, len(images))
-        manual_scenes = _normalize_manual_scenes(manual_scenes, len(images))
+        _assert_valid_manual_scenes(manual_scenes)
     elif not prompt:
         raise HTTPException(400, "Opis filmu jest wymagany dla plannera AI")
 
@@ -368,8 +359,6 @@ async def create_job(
         "job_id": job_id,
         "status": "planned",
         "credits_cost": credits.credits_for(model, manual_scenes),
-        # What was stored, which may differ from what was sent: the editor must
-        # start from the server's version of the plan.
         "scenes": manual_scenes,
     }
 

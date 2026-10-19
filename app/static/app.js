@@ -21,8 +21,8 @@
   // The manual plan being written on the upload screen, before any job exists.
   // Same shape as currentScenes; it becomes the job's plan in one POST /jobs.
   let draftScenes = [];
-  // One object URL per File: renderers run on every keystroke-level structure
-  // change, and a fresh createObjectURL each time would leak a blob per render.
+  // One object URL per File: the cards re-render on every structure change, and
+  // a fresh createObjectURL each time would leak a blob per render.
   const fileUrls = new WeakMap();
 
   // Elements
@@ -340,8 +340,7 @@
 
       connectSSE();
       if (manual) {
-        // The job is already 'planned'. The scenes come back from the server
-        // rather than from draftScenes, since it may have corrected them.
+        // The job is already 'planned'; the editor starts from the stored plan.
         imageCount = files.length;
         currentScenes = data.scenes;
         showPlanScreen(data.credits_cost);
@@ -385,7 +384,7 @@
       };
       renderSceneProgress();
     });
-    
+
     // Refund for scenes that failed. Emitted from the pipeline's `finally`, so it
     // arrives after a failed generation too, not only a successful one.
     eventSource.addEventListener('credits', e => {
@@ -525,7 +524,7 @@
       ta.placeholder = 'Co dzieje sie w tej scenie? Ruch kamery, akcja...';
       ta.addEventListener('input', () => {
         s.sub_prompt = ta.value;
-        if (opts.onInput) opts.onInput();
+        opts.onInput?.();
       });
       ta.addEventListener('change', () => opts.onFieldChange(i));
 
