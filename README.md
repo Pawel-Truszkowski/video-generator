@@ -1,5 +1,7 @@
 # Video Generator
 
+🇵🇱 Polski | [🇬🇧 English](README.en.md)
+
 Aplikacja webowa, która zamienia zestaw zdjęć i opis tekstowy w gotowy film MP4.
 Każda scena powstaje jako klip *image-to-video* w modelach udostępnianych przez
 [fal.ai](https://fal.ai) (Wan, Kling, Veo), a całość jest składana FFmpegiem
